@@ -101,56 +101,75 @@ def update_bars(client, start: str, end: str) -> None:
     print(f"  bar_1d: +{total} 行 / {len(days)} 天")
 
 
-def update_bars_1m(client, start: str, end: str, batch: int = 300) -> None:
-    """逐交易日增量写 bar_1m:fq=None 原始分钟价 + 当日后复权因子(日线 fq='post',按 code 广播到分钟)。
+def update_bars_1m(client, today: str, min_spare: int = 2_000_000) -> None:
+    """逐票补齐 bar_1m 到 today:每票自其 max(datetime) 之后(无数据则自上市日)补到 today。
 
-    分钟量大(全市场每日 ~132 万行),按 batch 只数分批拉 get_price(frequency='1m');
-    后复权因子在同一交易日内对每只票为常数,故按日取一次广播即可。"""
-    days = [d.strftime("%Y-%m-%d") for d in get_trade_days(start_date=start, end_date=end)]
-    if not days:
-        print("  bar_1m: up to date")
-        return
-    windows = client.query(
+    fq=None 原始分钟价 + 日线 fq='post' 因子(按日广播到分钟),按 (票, 年) 切块拉
+    get_price(frequency='1m')。游标取**各票各自的 max(datetime)**,而非全局最新日:
+    故缺失的票自动补全历史、已满的票只补新交易日,二者用同一逻辑收敛到全覆盖。
+
+    全市场全历史量巨大(数十亿行/配额),剩余配额低于 min_spare 时**优雅停止**;
+    bar_1m 为 ReplacingMergeTree((instrument_id, datetime) 去重),重叠插入幂等,
+    重跑同命令即按各票 max 自动 resume。
+    注:游标按 code 取 max,假设各票数据沿时间向前累积(无内部年份空洞);
+    当前数据状态(票要么全历史齐、要么完全缺)满足此前提。"""
+    today_d = dt.date.fromisoformat(today)
+    REQ_START = dt.date(2005, 1, 1)
+    secs = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"ORDER BY instrument_id").result_rows
+        f"WHERE type='stock' ORDER BY instrument_id").result_rows
+    maxmap = dict(client.query(
+        f"SELECT instrument_id, max(datetime) FROM {DATABASE}.bar_1m "
+        f"GROUP BY instrument_id").result_rows)
     pf = ["open", "close", "high", "low", "pre_close", "high_limit", "low_limit", "volume", "money", "avg", "paused"]
     out = ["instrument_id", "datetime", "open", "close", "high", "low", "pre_close",
            "high_limit", "low_limit", "volume", "money", "avg", "factor", "paused"]
     total = 0
-    for d in days:
-        day = dt.date.fromisoformat(d)
-        codes = [
-            code for code, start_date, end_date in windows
-            if (start_date is None or start_date <= day) and (end_date is None or day <= end_date)
-        ]
-        if not codes:
-            print(f"  bar_1m {d}: +0")
+    for ci, (code, start_date, end_date) in enumerate(secs, 1):
+        sp = get_query_count()["spare"]
+        if sp < min_spare:
+            print(f"  bar_1m: 剩余配额不足 {min_spare:,},优雅停止于第 {ci}/{len(secs)} 只 "
+                  f"({code});累计 +{total:,} 行,重跑续传。", flush=True)
+            return
+        code_start = max(start_date or REQ_START, REQ_START)
+        code_end = min(end_date or today_d, today_d)
+        have = maxmap.get(code)
+        fill_start = (have.date() + dt.timedelta(days=1)) if have else code_start
+        if fill_start > code_end:
             continue
-        fac = jqdatasdk.get_price(codes, end_date=d, count=1, frequency="daily", fields=["factor"],
-                                  fq="post", panel=False, skip_paused=False)
-        fmap = {}
-        if fac is not None and not fac.empty:
-            fac = fac.rename(columns={"code": "instrument_id"})
-            fmap = dict(zip(fac["instrument_id"], fac["factor"]))
-        day_rows = 0
-        for i in range(0, len(codes), batch):
-            chunk = codes[i:i + batch]
-            raw = jqdatasdk.get_price(chunk, start_date=d, end_date=d, frequency="1m", fields=pf,
+        code_rows = 0
+        for y in range(fill_start.year, code_end.year + 1):
+            ys = max(fill_start, dt.date(y, 1, 1)).isoformat()
+            ye = min(code_end, dt.date(y, 12, 31)).isoformat()
+            raw = jqdatasdk.get_price(code, start_date=ys, end_date=ye, frequency="1m", fields=pf,
                                       fq=None, panel=False, skip_paused=False)
             if raw is None or raw.empty:
                 continue
-            raw = raw.rename(columns={"code": "instrument_id", "time": "datetime"})
             raw = raw[raw["close"].notna()].copy()
             if raw.empty:
                 continue
-            raw["datetime"] = pd.to_datetime(raw["datetime"])
-            raw["factor"] = raw["instrument_id"].map(fmap).fillna(1.0)
+            fac = jqdatasdk.get_price(code, start_date=ys, end_date=ye, frequency="daily",
+                                      fields=["factor"], fq="post", panel=False, skip_paused=False)
+            raw["instrument_id"] = code
+            raw["datetime"] = pd.to_datetime(raw.index)
+            if fac is not None and not fac.empty:
+                fmap = {pd.Timestamp(t).date(): v for t, v in zip(fac.index, fac["factor"])}
+                raw["factor"] = raw["datetime"].dt.date.map(fmap)
+            else:
+                raw["factor"] = 1.0
+            raw["factor"] = raw["factor"].ffill().fillna(1.0)
             raw["paused"] = raw["paused"].fillna(0).astype("uint8")
             client.insert_df(f"{DATABASE}.bar_1m", raw[out])
-            day_rows += len(raw)
-        total += day_rows
-        print(f"  bar_1m {d}: +{day_rows}")
-    print(f"  bar_1m: +{total} 行 / {len(days)} 天")
+            code_rows += len(raw)
+            # 每 (票,年) 落盘即吐一行,确保重活阶段持续有日志(全历史票一只会打多行)
+            print(f"  bar_1m {code} {y}: +{len(raw):,} 行", flush=True)
+        total += code_rows
+        # 空请求票(已满、仅差未发布的今日)不刷屏,仅每 100 只打一次心跳
+        if code_rows == 0 and ci % 100 == 0:
+            print(f"  bar_1m 心跳 {ci}/{len(secs)} 只(均已最新,累计 +{total:,} 行)| spare {sp:,}", flush=True)
+        elif code_rows:
+            print(f"  bar_1m {code} 完成: +{code_rows:,} 行(到 {code_end})| 进度 {ci}/{len(secs)} | spare {sp:,}", flush=True)
+    print(f"  bar_1m: +{total:,} 行(逐票补到 {today})", flush=True)
 
 
 def _max_day(client, table, col):
@@ -165,6 +184,8 @@ def main() -> None:
     p.add_argument("--skip-is-st", action="store_true", help="跳过 is_st(ST 状态)增量")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
+    p.add_argument("--min-spare", type=int, default=2_000_000,
+                   help="bar_1m 逐票补齐时剩余配额低于此值优雅停止(重跑续传)")
     args = p.parse_args()
 
     bk.jq_auth()
@@ -210,13 +231,12 @@ def main() -> None:
               "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d"):
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
 
-    # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成
+    # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。
+    # 逐票自各自 max(datetime) 补到 today:缺失票补全历史、已满票只补新日,
+    # 配额不足优雅停止,重跑同命令自动续传(全市场全历史需跨多天)。
     if not args.skip_bars_1m:
-        print("== 6) bar_1m 增量(最后)==")
-        lastb1m = _max_day(client, "bar_1m", "datetime")
-        # 空表只从今日起增量;历史回补走 rebuild_from_jq.py --bars-1m(量巨大、单独跑)
-        b1mstart = (lastb1m.date() + dt.timedelta(days=1)).isoformat() if lastb1m else today
-        update_bars_1m(client, b1mstart, today)
+        print("== 6) bar_1m 逐票补齐(最后)==")
+        update_bars_1m(client, today, min_spare=args.min_spare)
 
     print("query count:", get_query_count())
     print("UPDATE DONE")
