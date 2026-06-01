@@ -1,0 +1,172 @@
+"""ClickHouse 表与视图 DDL.
+
+基本面镜像表的列由 vendored 查询模型(_jqsdk)程序化生成, 列名与语义与聚宽逻辑表完全一致,
+以便 get_fundamentals_sql 产出的 SQL 经 sqlglot 转译后可直接在 ClickHouse 执行.
+
+命名约定:
+- 行情和主表用 `instrument_id`, 对齐 factors 表.
+- 基本面镜像表用 `code` / `day` / `statDate` / `pubDate`, 必须与 vendored 模型 SQL 列名一致.
+"""
+from __future__ import annotations
+
+from ._jqsdk import balance, cash_flow, income, indicator, valuation
+
+from .db import DATABASE
+
+META = {"id", "code", "day", "pubDate", "statDate"}
+
+# 逻辑表 -> (jqdatasdk 模型, 数据列 ClickHouse 类型)
+_DECIMAL = "Nullable(Decimal(20, 4))"
+_FLOAT = "Nullable(Float64)"
+
+
+def data_columns(model) -> list[str]:
+    """返回模型中去掉 meta 列后的数据列."""
+    return [c.key for c in model.__table__.columns if c.key not in META]
+
+
+# 单季/累计/快照(statDate 键)基本面镜像表
+STATDATE_TABLES = {
+    "income_statement": (income, _DECIMAL),
+    "income_statement_acc": (income, _DECIMAL),
+    "cash_flow_statement": (cash_flow, _DECIMAL),
+    "cash_flow_statement_acc": (cash_flow, _DECIMAL),
+    "balance_sheet": (balance, _DECIMAL),
+    "financial_indicator": (indicator, _FLOAT),
+    "financial_indicator_acc": (indicator, _FLOAT),
+}
+
+# date 模式 ASOF 视图: 视图名 -> 底层 statDate 表
+DAY_VIEWS = {
+    "income_statement_day": ("income_statement", income),
+    "cash_flow_statement_day": ("cash_flow_statement", cash_flow),
+    "financial_indicator_day": ("financial_indicator", indicator),
+    "balance_sheet_day": ("balance_sheet", balance),
+}
+
+
+def statdate_table_ddl(name: str) -> str:
+    """生成 statDate 键基本面镜像表 DDL."""
+    model, col_type = STATDATE_TABLES[name]
+    cols = ",\n  ".join(f"`{c}` {col_type}" for c in data_columns(model))
+    return f"""CREATE TABLE IF NOT EXISTS {DATABASE}.{name} (
+  id Int64,
+  code String,
+  statDate Date,
+  pubDate Date,
+  {cols},
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (code, statDate)"""
+
+
+def stock_valuation_ddl() -> str:
+    """生成 stock_valuation 表 DDL."""
+    cols = ",\n  ".join(f"`{c}` {_FLOAT}" for c in data_columns(valuation))
+    return f"""CREATE TABLE IF NOT EXISTS {DATABASE}.stock_valuation (
+  id Int64,
+  code String,
+  day Date,
+  {cols},
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (code, day)"""
+
+
+def day_view_ddl(name: str) -> str:
+    """生成 date 模式基本面视图 DDL.
+
+    对每个 code 与 day, 取 pubDate<=day 的报告中 statDate 最大者作为最近报告期.
+    不能用 ASOF JOIN, 它只按 pubDate 取最近一条. 年报与一季报常同日披露,
+    ASOF 在并列时任取一条会错选去年年报, 聚宽返回 statDate 更大的当期报告.
+
+    两段式以保证谓词下推与执行效率. picked 只带 key, day 与 code,
+    GROUP BY code 与 day 后取 max(statDate), 再按 code 与 statDate 等值 JOIN 回基表.
+    """
+    base, model = DAY_VIEWS[name]
+    proj = ",\n  ".join(f"b.`{c}` AS `{c}`" for c in data_columns(model))
+    return f"""CREATE OR REPLACE VIEW {DATABASE}.{name} AS
+WITH picked AS (
+  SELECT sv.code AS code, sv.day AS day, max(b.statDate) AS statDate
+  FROM {DATABASE}.stock_valuation AS sv
+  LEFT JOIN {DATABASE}.{base} AS b
+    ON sv.code = b.code AND b.pubDate <= sv.day
+  GROUP BY sv.code, sv.day
+)
+SELECT b.id AS id, p.code AS code, p.day AS day, b.pubDate AS pubDate, p.statDate AS statDate,
+  {proj}
+FROM picked AS p
+LEFT JOIN {DATABASE}.{base} AS b
+  ON p.code = b.code AND p.statDate = b.statDate"""
+
+
+# ---- 行情 / 主表 DDL(聚宽 get_price / get_all_securities / get_trade_days)----
+MARKET_DDL = {
+    "trade_days": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.trade_days (
+  day Date,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at) ORDER BY day""",
+    "bar_1d": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.bar_1d (
+  instrument_id String, date Date,
+  open Nullable(Float64), close Nullable(Float64), high Nullable(Float64), low Nullable(Float64),
+  pre_close Nullable(Float64), high_limit Nullable(Float64), low_limit Nullable(Float64),
+  volume Nullable(Float64), money Nullable(Float64), avg Nullable(Float64),
+  factor Nullable(Float64), paused UInt8, is_st UInt8,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+PARTITION BY toYYYYMM(date)
+ORDER BY (instrument_id, date)""",
+    "bar_1m": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.bar_1m (
+  instrument_id String, datetime DateTime,
+  open Nullable(Float64), close Nullable(Float64), high Nullable(Float64), low Nullable(Float64),
+  pre_close Nullable(Float64), high_limit Nullable(Float64), low_limit Nullable(Float64),
+  volume Nullable(Float64), money Nullable(Float64), avg Nullable(Float64),
+  factor Nullable(Float64), paused UInt8,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+PARTITION BY toYYYYMM(datetime)
+ORDER BY (instrument_id, datetime)""",
+    "is_st": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.is_st (
+  instrument_id String, date Date, is_st UInt8,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (instrument_id, date)""",
+    "securities": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.securities (
+  instrument_id String, display_name Nullable(String), name Nullable(String),
+  start_date Nullable(Date32), end_date Nullable(Date32),
+  type Nullable(String), exchange Nullable(String), board_type Nullable(String),
+  industry_code Nullable(String), sector_code Nullable(String),
+  round_lot Nullable(Float64), status Nullable(String),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at) ORDER BY instrument_id""",
+}
+
+
+def all_table_ddls() -> dict[str, str]:
+    """返回全部基础表 DDL."""
+    ddls: dict[str, str] = {}
+    for name in STATDATE_TABLES:
+        ddls[name] = statdate_table_ddl(name)
+    ddls["stock_valuation"] = stock_valuation_ddl()
+    ddls.update(MARKET_DDL)
+    return ddls
+
+
+def create_all(client, include_views: bool = True, verbose: bool = True) -> None:
+    """创建全部 ClickHouse 表与可选视图."""
+    for name, ddl in all_table_ddls().items():
+        if verbose:
+            print(f"creating table {DATABASE}.{name}")
+        client.command(ddl)
+    if include_views:
+        for name in DAY_VIEWS:
+            if verbose:
+                print(f"creating view {DATABASE}.{name}")
+            client.command(day_view_ddl(name))
+
+
+if __name__ == "__main__":
+    from .db import auth_from_env, get_client
+
+    auth_from_env()
+    create_all(get_client())

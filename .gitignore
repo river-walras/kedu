@@ -1,0 +1,23 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Data (large; loaded into ClickHouse / regenerable)
+data/
+
+# 测试 live 快照缓存(live 数据,不入库)
+tests/_snapshots/
+
+# Scratch / temporary scripts
+tmp_*.py
+logs/
+
+.vscode/
