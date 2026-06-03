@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Sequence
 
+import numpy as np
 import pandas as pd
 
 from .db import DATABASE, get_client, query_df
@@ -38,14 +39,31 @@ _SEL_COLS = ["instrument_id", "open", "close", "high", "low", "pre_close",
 
 def get_price(security: str | Sequence[str], start_date: str | dt.date | None = None,
               end_date: str | dt.date | None = None, frequency: str = "daily",
-              fields: Sequence[str] | None = None, fq: str | None = "pre",
-              count: int | None = None) -> pd.DataFrame:
-    """本地复刻 jqdatasdk.get_price.
+              fields: Sequence[str] | None = None, skip_paused: bool = False,
+              fq: str | None = "pre", count: int | None = None,
+              panel: bool = True, fill_paused: bool = True,
+              round: bool = True) -> pd.DataFrame:
+    """本地复刻 jqdatasdk.get_price, 签名与聚宽原生一致.
 
     security 可为单代码 str 或代码 list.
     单代码返回窄表, index 为时间, 列为 fields, 与聚宽单标的一致.
     代码 list 返回对齐聚宽 panel=False 的长表, 列为 time, code 与 fields.
+
+    与聚宽对齐的参数语义:
+    - fq: 'pre'/'post'/'none'/None, 'none' 等价 None(不复权).
+    - skip_paused=True: 剔除停牌行(paused==1).
+    - fill_paused=False: 停牌行价格置 NaN、量/额置 0(默认 True 用停牌前价填充, 即存储口径).
+    - round=False: 复权价/量不做 round(默认 True 对齐聚宽).
+    - panel: 仅签名兼容; pandas>=0.25 恒返回 DataFrame.
+    - 未给 start_date 且未给 count 时, 默认窗口 2015-01-01..2015-12-31(对齐聚宽).
     """
+    if fq == "none":                      # 聚宽用字符串 'none' 表示不复权
+        fq = None
+    if count is None:                     # 默认窗口对齐聚宽(count 路径不套用 start 默认)
+        if start_date is None:
+            start_date = "2015-01-01"
+        if end_date is None:
+            end_date = "2015-12-31"
     if frequency in _DAILY:
         table, tcol, minute = "bar_1d", "date", False
     elif frequency in _MINUTE:
@@ -98,6 +116,11 @@ def get_price(security: str | Sequence[str], start_date: str | dt.date | None = 
         return _empty()
     df = df.sort_values(["instrument_id", tcol]).reset_index(drop=True)
 
+    if skip_paused:                        # 剔除停牌行(对齐聚宽 skip_paused)
+        df = df[df["paused"].astype("float64") != 1.0].reset_index(drop=True)
+        if df.empty:
+            return _empty()
+
     f = df["factor"].astype("float64")
     if fq is None:
         adj = pd.Series(1.0, index=df.index)
@@ -115,10 +138,10 @@ def get_price(security: str | Sequence[str], start_date: str | dt.date | None = 
     for fld in fields:
         if fld in _PRICE_FIELDS:
             v = df[fld].astype("float64") * adj if adjust else df[fld].astype("float64")
-            cols[fld] = v.round(2).to_numpy() if adjust else v.to_numpy()
+            cols[fld] = v.round(2).to_numpy() if (adjust and round) else v.to_numpy()
         elif fld == "volume":
-            v = (df["volume"].astype("float64") / adj).round() if adjust else df["volume"].astype("float64")
-            cols[fld] = v.to_numpy()
+            v = df["volume"].astype("float64") / adj if adjust else df["volume"].astype("float64")
+            cols[fld] = (v.round() if (adjust and round) else v).to_numpy()
         elif fld == "money":
             cols[fld] = df["money"].astype("float64").to_numpy()
         elif fld == "factor":
@@ -127,6 +150,15 @@ def get_price(security: str | Sequence[str], start_date: str | dt.date | None = 
             cols[fld] = df["paused"].astype("float64").to_numpy()
         else:
             cols[fld] = df[fld].to_numpy()
+
+    if not fill_paused:                    # 停牌行价格置 NaN、量额置 0(对齐聚宽 fill_paused=False)
+        pmask = (df["paused"].astype("float64") == 1.0).to_numpy()
+        if pmask.any():
+            for fld in fields:
+                if fld in _PRICE_FIELDS:
+                    cols[fld] = np.where(pmask, np.nan, cols[fld])
+                elif fld in ("volume", "money"):
+                    cols[fld] = np.where(pmask, 0.0, cols[fld])
 
     if single:
         return pd.DataFrame(cols, index=pd.Index(df[tcol].to_numpy(), name=tcol))

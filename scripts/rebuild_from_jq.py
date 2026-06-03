@@ -140,7 +140,7 @@ def rebuild_bars(client, start: str, resume: bool = True, limit_codes: int | Non
     client.command(MARKET_DDL["bar_1d"])  # IF NOT EXISTS
     end = dt.date.today().isoformat()
     codes = [r[0] for r in client.query(
-        f"SELECT instrument_id FROM {DATABASE}.securities ORDER BY instrument_id").result_rows]
+        f"SELECT instrument_id FROM {DATABASE}.securities WHERE type='stock' ORDER BY instrument_id").result_rows]
     if limit_codes:
         codes = codes[:limit_codes]
         LOG.info(f"  [测试模式] 仅前 {limit_codes} 只")
@@ -201,7 +201,7 @@ def rebuild_bars_1m(client, start_year: int = 2005, resume: bool = True,
     requested_start = dt.date(start_year, 1, 1)
     securities = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"ORDER BY instrument_id").result_rows
+        f"WHERE type='stock' ORDER BY instrument_id").result_rows
     if limit_codes:
         securities = securities[:limit_codes]
         LOG.info(f"  [测试模式] 仅前 {limit_codes} 只")

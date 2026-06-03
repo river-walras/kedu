@@ -35,6 +35,10 @@ TABLES = [
     ("industry_history", None),
     ("concepts", None),
     ("concept_history", None),
+    ("index_member_history", None),
+    ("index_weights", "weight_date"),
+    ("index_valuation", "day"),
+    ("index_sync_state", "covered_until"),
 ]
 
 

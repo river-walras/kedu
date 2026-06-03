@@ -38,6 +38,11 @@ from .concept import (  # noqa: F401
     get_concept_stocks,
     get_concept,
 )
+from .index import (  # noqa: F401
+    get_index_stocks,
+    get_index_weights,
+    get_index_valuation,
+)
 
 get_table_info = finance.get_table_info
 
@@ -64,6 +69,9 @@ __all__ = [
     "get_concepts",
     "get_concept_stocks",
     "get_concept",
+    "get_index_stocks",
+    "get_index_weights",
+    "get_index_valuation",
     "finance",
     "get_client",
     "auth",

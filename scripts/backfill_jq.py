@@ -111,7 +111,7 @@ def sync_is_st(client, today: str | None = None, limit_codes: int | None = None,
 
     windows = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"ORDER BY instrument_id").result_rows
+        f"WHERE type='stock' ORDER BY instrument_id").result_rows
     last = {r[0]: r[1] for r in client.query(
         f"SELECT instrument_id, max(date) FROM {DATABASE}.is_st GROUP BY instrument_id"
     ).result_rows}

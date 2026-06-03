@@ -179,6 +179,50 @@ ORDER BY (concept_code, stock, start_date)""",
 }
 
 
+# ---- 指数 DDL(聚宽 get_index_stocks / get_index_weights / get_index_valuation)----
+#
+# 维护方式决定读侧是否需要 FINAL:
+# - index_member_history 由 staging(index_member_seg)折叠后 TRUNCATE+reload,无重复版本,
+#   读查询无需 FINAL。禁止日更直接插同 key 闭区间(合并前新旧并存)。
+# - index_weights / index_valuation 逐月/逐日增量重插,存在待合并版本,读查询加 FINAL(表小)。
+# 指数列表沿用 securities 表(type='index'),不另建表。
+# position 保留聚宽成分股/权重的原始返回序,读侧 ORDER BY position, code。
+# index_sync_state 记录每个 (dataset, index_code) 已扫描到的交易日 covered_until,
+#   解决「多年不调仓无法判断扫完」与「空月/空日反复重拉」。dataset ∈ {member, weight, valuation}。
+_INDEX_VAL_COLS = [
+    "pe_ratio", "turnover_ratio", "pb_ratio", "ps_ratio", "pcf_ratio", "capitalization",
+    "market_cap", "circulating_cap", "circulating_market_cap", "pe_ratio_lyr", "pcf_ratio2",
+    "dividend_ratio", "free_cap", "free_market_cap", "a_cap", "a_market_cap",
+]
+_INDEX_VAL_COLS_DDL = ",\n  ".join(f"`{c}` {_FLOAT}" for c in _INDEX_VAL_COLS)
+
+INDEX_DDL = {
+    "index_member_history": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.index_member_history (
+  index_code String, stock String, position UInt32,
+  start_date Date, end_date Nullable(Date),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (index_code, stock, start_date)""",
+    "index_weights": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.index_weights (
+  index_code String, code String, position UInt32,
+  weight Nullable(Float64), display_name Nullable(String), weight_date Date,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (index_code, weight_date, code)""",
+    "index_valuation": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.index_valuation (
+  code String, day Date,
+  {_INDEX_VAL_COLS_DDL},
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (code, day)""",
+    "index_sync_state": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.index_sync_state (
+  dataset String, index_code String, covered_until Date,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (dataset, index_code)""",
+}
+
+
 def all_table_ddls() -> dict[str, str]:
     """返回全部基础表 DDL."""
     ddls: dict[str, str] = {}
@@ -187,6 +231,7 @@ def all_table_ddls() -> dict[str, str]:
     ddls["stock_valuation"] = stock_valuation_ddl()
     ddls.update(MARKET_DDL)
     ddls.update(CLASSIFY_DDL)
+    ddls.update(INDEX_DDL)
     return ddls
 
 

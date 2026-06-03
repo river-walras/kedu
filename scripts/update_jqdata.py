@@ -28,6 +28,7 @@ from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
 import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
+import scripts.backfill_index as bx  # noqa: E402
 
 
 def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
@@ -45,10 +46,16 @@ def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
 
 
 def update_securities(client) -> None:
-    df = get_all_securities(["stock"]).reset_index().rename(columns={"index": "instrument_id"})
+    """股票 + 指数一并落 securities(type 区分)。指数供 get_all_securities(['index'])、
+    指数日线(update_bars 无 type 过滤自动带上)与指数成分/权重/估值宇宙使用。"""
+    parts = []
+    for t in ("stock", "index"):
+        d = get_all_securities([t]).reset_index().rename(columns={"index": "instrument_id"})
+        d["type"] = t
+        parts.append(d)
+    df = pd.concat(parts, ignore_index=True)
     df["start_date"] = pd.to_datetime(df["start_date"]).dt.date
     df["end_date"] = pd.to_datetime(df["end_date"]).dt.date
-    df["type"] = "stock"
     for c in ("exchange", "board_type", "industry_code", "sector_code", "round_lot", "status"):
         if c not in df:
             df[c] = None
@@ -56,7 +63,8 @@ def update_securities(client) -> None:
             "exchange", "board_type", "industry_code", "sector_code", "round_lot", "status"]
     client.command(f"TRUNCATE TABLE {DATABASE}.securities")
     client.insert_df(f"{DATABASE}.securities", df[cols])
-    print(f"  securities: {len(df)}")
+    n_idx = int((df["type"] == "index").sum())
+    print(f"  securities: {len(df)}(stock {len(df) - n_idx} / index {n_idx})")
 
 
 def update_bars(client, start: str, end: str) -> None:
@@ -184,6 +192,7 @@ def main() -> None:
     p.add_argument("--skip-stk", action="store_true", help="跳过 STK 报告期原始表(finance.run_query 底表)增量")
     p.add_argument("--skip-is-st", action="store_true", help="跳过 is_st(ST 状态)增量")
     p.add_argument("--skip-industry", action="store_true", help="跳过行业/概念分类刷新(industries/industry_history/concepts/concept_history)")
+    p.add_argument("--skip-index", action="store_true", help="跳过指数成分/权重/估值增量(index_member_history/index_weights/index_valuation)")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--min-spare", type=int, default=2_000_000,
@@ -235,10 +244,18 @@ def main() -> None:
         print("== 6) 行业/概念增量(sync:列表 + 逐股 walk 续传 + 折叠)==")
         bi.sync(client, today=today, min_spare=args.min_spare)
 
+    if not args.skip_index:
+        # 指数成分/权重/估值:轻量增量(sync_daily)。历史种子(二分成分回补 + 月度权重全扫 +
+        # 历史指数 bar)走 scripts/backfill_index.py 手动跑;此处仅续传/日更,配额不足优雅停止。
+        # 指数日线 bar_1d 已由上面 update_bars 自带(securities 含 type='index')。
+        print("== 6.5) 指数成分/权重/估值增量(sync_daily;历史种子见 backfill_index.py)==")
+        bx.sync_daily(client, today=today, min_spare=args.min_spare)
+
     for t in ("trade_days", "income_statement", "income_statement_acc", "balance_sheet",
               "cash_flow_statement", "cash_flow_statement_acc",
               "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
-              "industries", "industry_history", "concepts", "concept_history"):
+              "industries", "industry_history", "concepts", "concept_history",
+              "index_member_history", "index_weights", "index_valuation", "index_sync_state"):
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。

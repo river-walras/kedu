@@ -1,6 +1,6 @@
 """本地证券列表, 复刻聚宽 get_all_securities(types=[], date=None).
 
-数据源为 ClickHouse `jqdata.securities`, 仅股票, 由 update_jqdata.update_securities 同步.
+数据源为 ClickHouse `jqdata.securities`(股票 + 指数, type 区分), 由 update_jqdata.update_securities 同步.
 返回 DataFrame, index 为 code, 列为 display_name, name, start_date, end_date, type.
 与 jqdatasdk 逐项一致, start_date/end_date 为 datetime64[ns], 未退市哨兵为 2200-01-01.
 """
@@ -27,7 +27,7 @@ def _to_date(x: str | dt.date | None) -> dt.date | None:
     return pd.Timestamp(x).date()
 
 
-def get_all_securities(types: Sequence[str] | str = (),
+def get_all_securities(types: Sequence[str] | str = [],  # noqa: B006  只读不改, 对齐聚宽默认 []
                        date: str | dt.date | None = None) -> pd.DataFrame:
     """获取证券列表.
 
