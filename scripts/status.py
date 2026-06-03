@@ -31,6 +31,10 @@ TABLES = [
     ("stk_fin_forcast", "pub_date"),
     ("stk_audit_opinion", "pub_date"),
     ("stk_report_disclosure", "pub_date"),
+    ("industries", None),
+    ("industry_history", None),
+    ("concepts", None),
+    ("concept_history", None),
 ]
 
 

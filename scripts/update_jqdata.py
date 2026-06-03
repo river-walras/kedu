@@ -27,6 +27,7 @@ from jqdatasdk import (get_all_securities, get_query_count, get_trade_days,  # n
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
 import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
+import scripts.backfill_industry as bi  # noqa: E402
 
 
 def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
@@ -182,6 +183,7 @@ def main() -> None:
     p.add_argument("--skip-bars-1m", action="store_true", help="跳过 bar_1m 分钟线更新")
     p.add_argument("--skip-stk", action="store_true", help="跳过 STK 报告期原始表(finance.run_query 底表)增量")
     p.add_argument("--skip-is-st", action="store_true", help="跳过 is_st(ST 状态)增量")
+    p.add_argument("--skip-industry", action="store_true", help="跳过行业/概念分类刷新(industries/industry_history/concepts/concept_history)")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--min-spare", type=int, default=2_000_000,
@@ -226,16 +228,24 @@ def main() -> None:
         print("== 5) STK 报告期原始表同步 (finance.run_query 底表;空表→全量,有数据→增量) ==")
         stk.sync_all(client, overlap_days=args.stk_overlap_days)
 
+    if not args.skip_industry:
+        # 行业/概念:与 backfill_industry.py 同一条 sync() 路径(列表 + 逐股 walk 续传到 today + 折叠)。
+        # 历史没补完会在此续传(配额不足优雅停止、重跑续传);补完后每天只补新交易日。
+        # 想更快种子化历史,可先单独跑 scripts/backfill_industry.py(专用配额、不和 bar_1m 抢)。
+        print("== 6) 行业/概念增量(sync:列表 + 逐股 walk 续传 + 折叠)==")
+        bi.sync(client, today=today, min_spare=args.min_spare)
+
     for t in ("trade_days", "income_statement", "income_statement_acc", "balance_sheet",
               "cash_flow_statement", "cash_flow_statement_acc",
-              "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d"):
+              "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
+              "industries", "industry_history", "concepts", "concept_history"):
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。
     # 逐票自各自 max(datetime) 补到 today:缺失票补全历史、已满票只补新日,
     # 配额不足优雅停止,重跑同命令自动续传(全市场全历史需跨多天)。
     if not args.skip_bars_1m:
-        print("== 6) bar_1m 逐票补齐(最后)==")
+        print("== 7) bar_1m 逐票补齐(最后)==")
         update_bars_1m(client, today, min_spare=args.min_spare)
 
     print("query count:", get_query_count())

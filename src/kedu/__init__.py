@@ -27,6 +27,17 @@ from .finance import finance  # noqa: F401
 from .calendar import get_trade_days, get_all_trade_days  # noqa: F401
 from .securities import get_all_securities  # noqa: F401
 from .extras import get_extras  # noqa: F401
+from .industry import (  # noqa: F401
+    get_industries,
+    get_industry_stocks,
+    get_history_industry,
+    get_industry,
+)
+from .concept import (  # noqa: F401
+    get_concepts,
+    get_concept_stocks,
+    get_concept,
+)
 
 get_table_info = finance.get_table_info
 
@@ -46,6 +57,13 @@ __all__ = [
     "get_all_trade_days",
     "get_all_securities",
     "get_extras",
+    "get_industries",
+    "get_industry_stocks",
+    "get_history_industry",
+    "get_industry",
+    "get_concepts",
+    "get_concept_stocks",
+    "get_concept",
     "finance",
     "get_client",
     "auth",

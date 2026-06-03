@@ -142,6 +142,43 @@ ORDER BY (instrument_id, date)""",
 }
 
 
+# ---- 行业 / 概念分类 DDL(聚宽 get_industries / get_industry_stocks /
+#      get_history_industry / get_industry / get_concepts / get_concept_stocks / get_concept)----
+#
+# 维护方式决定读侧是否需要 FINAL:
+# - industries / industry_history / concepts 由「全量权威拉取 + TRUNCATE+reload」维护,
+#   无重复版本,读查询无需 FINAL。
+# - concept_history 无历史 API,由逐日快照 diff 而来,日更靠改写 end_date 重插关区间,
+#   存在待合并版本,读查询一律加 FINAL(表小,代价低)。
+# 区间「某日活跃」语义:start_date <= d AND (end_date IS NULL OR end_date >= d),
+# end_date 含当日(对齐 get_history_industry 示例:截至 2024-02-07、下一区间自 2024-02-08)。
+CLASSIFY_DDL = {
+    "industries": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.industries (
+  name String, industry_code String, industry_name String,
+  start_date Date, end_date Nullable(Date),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (name, industry_code, start_date)""",
+    "industry_history": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.industry_history (
+  name String, industry_code String, stock String,
+  start_date Date, end_date Nullable(Date),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (name, industry_code, stock, start_date)""",
+    "concepts": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.concepts (
+  concept_code String, concept_name String, start_date Date,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY concept_code""",
+    "concept_history": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.concept_history (
+  concept_code String, stock String,
+  start_date Date, end_date Nullable(Date),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (concept_code, stock, start_date)""",
+}
+
+
 def all_table_ddls() -> dict[str, str]:
     """返回全部基础表 DDL."""
     ddls: dict[str, str] = {}
@@ -149,6 +186,7 @@ def all_table_ddls() -> dict[str, str]:
         ddls[name] = statdate_table_ddl(name)
     ddls["stock_valuation"] = stock_valuation_ddl()
     ddls.update(MARKET_DDL)
+    ddls.update(CLASSIFY_DDL)
     return ddls
 
 
