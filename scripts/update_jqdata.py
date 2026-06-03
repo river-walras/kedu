@@ -197,12 +197,21 @@ def main() -> None:
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--min-spare", type=int, default=2_000_000,
                    help="bar_1m 逐票补齐时剩余配额低于此值优雅停止(重跑续传)")
+    p.add_argument("--only-bars-1m", action="store_true",
+                   help="只跑 bar_1m 逐票补齐,跳过其余全部步骤(逐票自 max(datetime) 续传)")
     args = p.parse_args()
 
     bk.jq_auth()
     auth_from_env()
     client = get_client()
     today = dt.date.today().isoformat()
+
+    if args.only_bars_1m:
+        print("== bar_1m 逐票补齐(only)==")
+        update_bars_1m(client, today, min_spare=args.min_spare)
+        print("query count:", get_query_count())
+        print("UPDATE DONE")
+        return
 
     print("== 0) trade_days ==")
     bk.sync_trade_days(client)
