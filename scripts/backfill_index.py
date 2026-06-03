@@ -19,9 +19,11 @@
 进度与续传:index_sync_state(dataset, index_code, covered_until) 记每个指数已扫到的交易日;
 逐指数边界检查剩余配额,低于 min_spare 优雅停止、重跑续传(种子与日更同一路径,covered 保证只取增量)。
 
-用法(历史种子,可反复跑续传):
+用法(历史种子,可反复跑续传;首次会自动把指数灌进 securities,无需先手工同步):
   uv run --env-file .env python scripts/backfill_index.py
-  可选:--min-spare N、--member-step N、--skip-bars。
+  可选:--member-step N、--min-spare N、--sync-securities、
+        --skip-valuation / --skip-weights / --skip-members / --skip-bars
+  例:只灌指数日线 → 加 --skip-valuation --skip-weights --skip-members
 日常增量由 update_jqdata.py 调 sync_daily()(不含历史 bar 种子)。
 """
 from __future__ import annotations
@@ -485,17 +487,50 @@ def sync(client, today=None, min_spare: int = 2_000_000, step: int = MEMBER_STEP
         backfill_index_bars(client, end=(today or dt.date.today().isoformat()))
 
 
+def _ensure_index_universe(client, force: bool = False) -> None:
+    """确保 securities 含指数(type='index');缺失或 force 时用 get_all_securities 刷新(股票+指数)。
+
+    使本脚本自给:无需先手工跑 update_securities。延迟导入 update_securities 避免循环依赖。
+    """
+    client.command(MARKET_DDL["securities"])
+    n = client.query(
+        f"SELECT count() FROM {DATABASE}.securities WHERE type='index'").result_rows[0][0]
+    if force or n == 0:
+        from scripts.update_jqdata import update_securities  # 延迟导入,避免与 update_jqdata 循环
+        print(f"  securities 现有指数 {n} 只,{'强制' if force else '缺失'}刷新 securities…", flush=True)
+        update_securities(client)
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="指数成分/权重/估值/日线 回补(反复跑续传)。")
+    p = argparse.ArgumentParser(description="指数成分/权重/估值/日线 回补(反复跑续传,断点续传)。")
+    p.add_argument("--sync-securities", action="store_true",
+                   help="强制先刷新 securities(股票+指数);securities 无指数时也会自动触发")
+    p.add_argument("--skip-valuation", action="store_true", help="跳过指数估值")
+    p.add_argument("--skip-weights", action="store_true", help="跳过指数权重")
+    p.add_argument("--skip-members", action="store_true", help="跳过指数成分(二分+折叠)")
+    p.add_argument("--skip-bars", action="store_true", help="跳过指数日线 bar 种子")
     p.add_argument("--min-spare", type=int, default=2_000_000, help="逐指数剩余配额低于此值优雅停止")
     p.add_argument("--member-step", type=int, default=MEMBER_STEP, help="成分二分粗网格步长(交易日)")
-    p.add_argument("--skip-bars", action="store_true", help="跳过指数日线历史 bar 种子")
     args = p.parse_args()
 
     bk.jq_auth()
     auth_from_env()
     client = get_client()
-    sync(client, min_spare=args.min_spare, step=args.member_step, skip_bars=args.skip_bars)
+    _ensure_index_universe(client, force=args.sync_securities)
+    if not args.skip_valuation:
+        print("== 指数估值 ==")
+        backfill_index_valuation(client)
+    if not args.skip_weights:
+        print("== 指数权重 ==")
+        backfill_index_weights(client, min_spare=args.min_spare)
+    if not args.skip_members:
+        print("== 指数成分二分 ==")
+        walk_index_members(client, min_spare=args.min_spare, step=args.member_step)
+        print("== 折叠指数成分区间 ==")
+        build_index_member_history(client)
+    if not args.skip_bars:
+        print("== 指数日线 bar 种子 ==")
+        backfill_index_bars(client)
     print("query count:", get_query_count())
     print("DONE")
 
