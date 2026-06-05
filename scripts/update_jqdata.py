@@ -29,6 +29,7 @@ import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
 import scripts.backfill_index as bx  # noqa: E402
+import scripts.backfill_margin as bm  # noqa: E402
 
 
 def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
@@ -193,8 +194,12 @@ def main() -> None:
     p.add_argument("--skip-is-st", action="store_true", help="跳过 is_st(ST 状态)增量")
     p.add_argument("--skip-industry", action="store_true", help="跳过行业/概念分类刷新(industries/industry_history/concepts/concept_history)")
     p.add_argument("--skip-index", action="store_true", help="跳过指数成分/权重/估值增量(index_member_history/index_weights/index_valuation)")
+    p.add_argument("--skip-margin", action="store_true", help="跳过融资融券增量(mtss/margin_target_history)")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
+    p.add_argument("--bars-overlap-days", type=int, default=10,
+                   help="bar_1d 增量回拉天数:自 max(day)-N 起重拉,覆盖盘中快照/当日定值修正"
+                        "(ReplacingMergeTree 按 _ingested_at 顶旧值)")
     p.add_argument("--min-spare", type=int, default=2_000_000,
                    help="bar_1m 逐票补齐时剩余配额低于此值优雅停止(重跑续传)")
     p.add_argument("--only-bars-1m", action="store_true",
@@ -239,7 +244,8 @@ def main() -> None:
     if not args.skip_bars:
         print("== 4) bar_1d 增量 ==")
         lastb = _max_day(client, "bar_1d", "date")
-        bstart = (lastb + dt.timedelta(days=1)).isoformat() if lastb else "2005-01-01"
+        # 不用 max(day)+1:回拉 N 天重叠重写,让盘中快照/当日定值修正被新版本顶掉。
+        bstart = (lastb - dt.timedelta(days=args.bars_overlap_days)).isoformat() if lastb else "2005-01-01"
         update_bars(client, bstart, today)
 
     if not args.skip_stk:
@@ -260,11 +266,18 @@ def main() -> None:
         print("== 6.5) 指数成分/权重/估值增量(sync_daily;历史种子见 backfill_index.py)==")
         bx.sync_daily(client, today=today, min_spare=args.min_spare)
 
+    if not args.skip_margin:
+        # 融资融券:标的列表逐日 walk + 折叠,mtss 逐日(当日标的并集)续传;配额不足优雅停止。
+        # 历史种子也走同一 sync() 路径,反复跑续传。
+        print("== 6.8) 融资融券增量(mtss 逐日 + 标的列表 walk+折叠)==")
+        bm.sync(client, today=today, min_spare=args.min_spare)
+
     for t in ("trade_days", "income_statement", "income_statement_acc", "balance_sheet",
               "cash_flow_statement", "cash_flow_statement_acc",
               "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
               "industries", "industry_history", "concepts", "concept_history",
-              "index_member_history", "index_weights", "index_valuation", "index_sync_state"):
+              "index_member_history", "index_weights", "index_valuation", "index_sync_state",
+              "mtss", "margin_target_history"):
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。

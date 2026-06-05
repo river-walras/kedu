@@ -43,6 +43,11 @@ from .index import (  # noqa: F401
     get_index_weights,
     get_index_valuation,
 )
+from .margin import (  # noqa: F401
+    get_mtss,
+    get_margincash_stocks,
+    get_marginsec_stocks,
+)
 
 get_table_info = finance.get_table_info
 
@@ -72,6 +77,9 @@ __all__ = [
     "get_index_stocks",
     "get_index_weights",
     "get_index_valuation",
+    "get_mtss",
+    "get_margincash_stocks",
+    "get_marginsec_stocks",
     "finance",
     "get_client",
     "auth",

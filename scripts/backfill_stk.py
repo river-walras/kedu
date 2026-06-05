@@ -45,6 +45,23 @@ def _model(jq_name: str):
     return getattr(finance, jq_name)
 
 
+def _chunk_col(cols: set[str]) -> str | None:
+    """全量按年分块所用日期列(取报告期/披露日,无则用交易日 date)。"""
+    for c in ("end_date", "pub_date", "date"):
+        if c in cols:
+            return c
+    return None
+
+
+def _watermark_col(cols: set[str]) -> str | None:
+    """增量水位列:**优先 pub_date** —— 财报表靠披露日水位才能补到「旧报告期、新披露/重述」;
+    市场汇总表(STK_MT_TOTAL / STK_EXCHANGE_TRADE_INFO)无 pub_date,退到交易日 date。"""
+    for c in ("pub_date", "date", "end_date"):
+        if c in cols:
+            return c
+    return None
+
+
 def _prep(df: pd.DataFrame, schema: list[tuple[str, str]]) -> pd.DataFrame:
     df = df.copy()
     for col, ctype in schema:
@@ -70,7 +87,7 @@ def backfill_table(client, jq_name: str, schema: list[tuple[str, str]],
     ch = STK_TABLES[jq_name]
     model = _model(jq_name)
     cols = {c for c, _ in schema}
-    chunk_col = "end_date" if "end_date" in cols else ("pub_date" if "pub_date" in cols else None)
+    chunk_col = _chunk_col(cols)
 
     if chunk_col is None:
         df = finance.run_offset_query(query(model))
@@ -97,12 +114,19 @@ def backfill_table(client, jq_name: str, schema: list[tuple[str, str]],
 
 
 def incremental(client, jq_name: str, schema: list[tuple[str, str]], overlap_days: int = 180) -> int:
-    """按 pub_date 近窗口增量 upsert(ReplacingMergeTree 幂等,含 report_type=1 重述)。"""
+    """按水位列近窗口增量 upsert(ReplacingMergeTree 幂等,含 report_type=1 重述)。
+
+    水位列优先 pub_date(财报表补「旧期新披露/重述」);市场汇总表无 pub_date 时退到 date。
+    """
     ch = STK_TABLES[jq_name]
     model = _model(jq_name)
-    mx = client.query(f"SELECT max(pub_date) FROM {DATABASE}.{ch}").result_rows[0][0]
+    cur = _watermark_col({c for c, _ in schema})
+    if cur is None:
+        qlog(f"  {ch}: 无水位列,跳过增量")
+        return 0
+    mx = client.query(f"SELECT max({cur}) FROM {DATABASE}.{ch}").result_rows[0][0]
     since = (mx - dt.timedelta(days=overlap_days)).isoformat() if mx else "2005-01-01"
-    df = finance.run_offset_query(query(model).filter(model.pub_date >= since))
+    df = finance.run_offset_query(query(model).filter(getattr(model, cur) >= since))
     if df.empty:
         qlog(f"  {ch}: +0 (since {since})")
         return 0

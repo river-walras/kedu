@@ -223,6 +223,33 @@ ORDER BY (dataset, index_code)""",
 }
 
 
+# ---- 融资融券 DDL(聚宽 get_mtss / get_margincash_stocks / get_marginsec_stocks)----
+#
+# - mtss            逐股融资融券明细,按 (sec_code, date) 唯一,ReplacingMergeTree。
+# - margin_target_history  融资/融券标的列表折叠区间(type='cash'/'sec'),由
+#   scripts/backfill_margin.py 从 staging margin_target_raw(逐日快照)gaps-and-islands
+#   折叠后 TRUNCATE+reload,无重复版本 → 读侧不加 FINAL。区间「某日活跃」语义同 index/industry:
+#   start_date <= d AND (end_date IS NULL OR end_date >= d)。
+#   get_*_stocks(date=None) 的「最近一次披露」锚点取 staging margin_target_raw 的 max(date)
+#   (开区间不记录覆盖到哪天),故 staging 须保留。
+MARGIN_DDL = {
+    "mtss": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.mtss (
+  sec_code String, date Date,
+  fin_value Nullable(Float64), fin_buy_value Nullable(Float64), fin_refund_value Nullable(Float64),
+  sec_value Nullable(Float64), sec_sell_value Nullable(Float64), sec_refund_value Nullable(Float64),
+  fin_sec_value Nullable(Float64),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (sec_code, date)""",
+    "margin_target_history": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.margin_target_history (
+  type String, stock String,
+  start_date Date, end_date Nullable(Date),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (type, stock, start_date)""",
+}
+
+
 def all_table_ddls() -> dict[str, str]:
     """返回全部基础表 DDL."""
     ddls: dict[str, str] = {}
@@ -232,6 +259,7 @@ def all_table_ddls() -> dict[str, str]:
     ddls.update(MARKET_DDL)
     ddls.update(CLASSIFY_DDL)
     ddls.update(INDEX_DDL)
+    ddls.update(MARGIN_DDL)
     return ddls
 
 

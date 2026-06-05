@@ -65,13 +65,13 @@ def _active(iso: str) -> str:
 def get_index_stocks(index_symbol: str, date: str | dt.date | None = None) -> list[str]:
     """获取某指数在给定日期的成分股,复刻 jqdatasdk.get_index_stocks。返回股票代码 list。
 
-    顺序对齐聚宽返回序(ORDER BY position),date 默认北京今天。
+    顺序对齐聚宽返回序(按股票代码升序),date 默认北京今天。
     """
     cli = get_client()
     iso = (_to_date(date) or _today()).isoformat()
     sql = (f"SELECT stock FROM {DATABASE}.index_member_history "
            f"WHERE index_code = {_q(index_symbol)} AND {_active(iso)} "
-           f"ORDER BY position, stock")
+           f"ORDER BY stock")
     return [r[0] for r in cli.query(sql).result_rows]
 
 

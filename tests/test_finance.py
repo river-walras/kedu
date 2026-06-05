@@ -81,6 +81,13 @@ FIXED_CASES = [
     ("INCOME 600000@2020Q3 (run_query)", "STK_INCOME_STATEMENT",
      lambda m: query(m).filter(m.code == "600000.XSHG", m.end_date == "2020-09-30"),
      False, None),
+    # date 键市场表(无 pub_date/end_date):融资融券汇总 / 沪深市场每日成交概况
+    ("MT_TOTAL 2019-05-23", "STK_MT_TOTAL",
+     lambda m: query(m).filter(m.date == "2019-05-23"),
+     True, None),
+    ("EXCHANGE_TRADE_INFO 2022-01-04", "STK_EXCHANGE_TRADE_INFO",
+     lambda m: query(m).filter(m.date == "2022-01-04"),
+     True, None),
 ]
 
 

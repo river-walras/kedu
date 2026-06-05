@@ -22,6 +22,9 @@ STK_TABLES: dict[str, str] = {
     "STK_AUDIT_OPINION": "stk_audit_opinion",
     "STK_REPORT_DISCLOSURE": "stk_report_disclosure",
     "STK_STATUS_CHANGE": "stk_status_change",
+    # 市场每日成交概况 / 融资融券汇总(均以 date 为键,无 pub_date/end_date)
+    "STK_EXCHANGE_TRADE_INFO": "stk_exchange_trade_info",
+    "STK_MT_TOTAL": "stk_mt_total",
 }
 
 
