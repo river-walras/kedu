@@ -48,6 +48,7 @@ from .margin import (  # noqa: F401
     get_margincash_stocks,
     get_marginsec_stocks,
 )
+from .locked_shares import get_locked_shares  # noqa: F401
 
 get_table_info = finance.get_table_info
 
@@ -80,6 +81,7 @@ __all__ = [
     "get_mtss",
     "get_margincash_stocks",
     "get_marginsec_stocks",
+    "get_locked_shares",
     "finance",
     "get_client",
     "auth",

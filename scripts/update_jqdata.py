@@ -30,6 +30,7 @@ import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
 import scripts.backfill_index as bx  # noqa: E402
 import scripts.backfill_margin as bm  # noqa: E402
+import scripts.backfill_locked_shares as bls  # noqa: E402
 
 
 def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
@@ -195,6 +196,7 @@ def main() -> None:
     p.add_argument("--skip-industry", action="store_true", help="跳过行业/概念分类刷新(industries/industry_history/concepts/concept_history)")
     p.add_argument("--skip-index", action="store_true", help="跳过指数成分/权重/估值增量(index_member_history/index_weights/index_valuation)")
     p.add_argument("--skip-margin", action="store_true", help="跳过融资融券增量(mtss/margin_target_history)")
+    p.add_argument("--skip-locked-shares", action="store_true", help="跳过限售解禁数据集刷新(locked_shares)")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--bars-overlap-days", type=int, default=10,
@@ -271,6 +273,13 @@ def main() -> None:
         # 历史种子也走同一 sync() 路径,反复跑续传。
         print("== 6.8) 融资融券增量(mtss 逐日 + 标的列表 walk+折叠)==")
         bm.sync(client, today=today, min_spare=args.min_spare)
+
+    if not args.skip_locked_shares:
+        # 限售解禁:聚宽独立数据集(含未来预计行、num 经送转调整),不可由 STK_* 重算 ->
+        # 全量重拉刷新(每票一条宽窗口请求;refresh 让未来预计行的 rate 随股本变化更新)。
+        # 初次种子(空表只拉缺票、可断点续传)直接跑 scripts/backfill_locked_shares.py。
+        print("== 6.9) 限售解禁数据集刷新(locked_shares 全量重拉)==")
+        bls.backfill(client, refresh=True, min_spare=args.min_spare)
 
     for t in ("trade_days", "income_statement", "income_statement_acc", "balance_sheet",
               "cash_flow_statement", "cash_flow_statement_acc",

@@ -88,6 +88,54 @@ FIXED_CASES = [
     ("EXCHANGE_TRADE_INFO 2022-01-04", "STK_EXCHANGE_TRADE_INFO",
      lambda m: query(m).filter(m.date == "2022-01-04"),
      True, None),
+    # ---- 上市公司基本信息族(reference/上市公司基本信息)----
+    ("COMPANY_INFO 600276", "STK_COMPANY_INFO",
+     lambda m: query(m).filter(m.code == "600276.XSHG"),
+     True, None),
+    ("COMPANY_INFO 000001 (run_query)", "STK_COMPANY_INFO",
+     lambda m: query(m).filter(m.code == "000001.XSHE"),
+     False, None),
+    ("LIST 000651", "STK_LIST",
+     lambda m: query(m).filter(m.code == "000651.XSHE"),
+     True, None),
+    ("LIST 退市股 600002", "STK_LIST",
+     lambda m: query(m).filter(m.code == "600002.XSHG"),
+     True, None),
+    ("NAME_HISTORY 600276", "STK_NAME_HISTORY",
+     lambda m: query(m).filter(m.code == "600276.XSHG"),
+     True, None),
+    ("EMPLOYEE_INFO 600276 pub>=2015", "STK_EMPLOYEE_INFO",
+     lambda m: query(m).filter(m.code == "600276.XSHG", m.pub_date >= "2015-01-01"),
+     True, None),
+    ("HOLDER_NUM 000002 pub>=2015", "STK_HOLDER_NUM",
+     lambda m: query(m).filter(m.code == "000002.XSHE", m.pub_date >= "2015-01-01"),
+     True, None),
+    ("LIMITED_SHARES_LIST 601688 pub>2018", "STK_LIMITED_SHARES_LIST",
+     lambda m: query(m).filter(m.code == "601688.XSHG", m.pub_date > "2018-01-01"),
+     True, None),
+    ("LIMITED_SHARES_UNLIMIT 600276 pub>2015", "STK_LIMITED_SHARES_UNLIMIT",
+     lambda m: query(m).filter(m.code == "600276.XSHG", m.pub_date > "2015-01-01"),
+     True, None),
+    ("SHAREHOLDERS_SHARE_CHANGE 000002 pub>2015", "STK_SHAREHOLDERS_SHARE_CHANGE",
+     lambda m: query(m).filter(m.code == "000002.XSHE", m.pub_date > "2015-01-01"),
+     True, None),
+    ("CAPITAL_CHANGE 600276 pub>2015", "STK_CAPITAL_CHANGE",
+     lambda m: query(m).filter(m.code == "600276.XSHG", m.pub_date > "2015-01-01"),
+     True, None),
+    ("SHARES_FROZEN 600520 pub>2015", "STK_SHARES_FROZEN",
+     lambda m: query(m).filter(m.code == "600520.XSHG", m.pub_date > "2015-01-01"),
+     True, None),
+    ("SHAREHOLDER_TOP10 600276 pub>2015", "STK_SHAREHOLDER_TOP10",
+     lambda m: query(m).filter(m.code == "600276.XSHG", m.pub_date > "2015-01-01"),
+     True, None),
+    ("SHAREHOLDER_FLOATING_TOP10 600276 pub>2015", "STK_SHAREHOLDER_FLOATING_TOP10",
+     lambda m: query(m).filter(m.code == "600276.XSHG", m.pub_date > "2015-01-01"),
+     True, None),
+    # in_ 多 end_date(十大股东按报告期)
+    ("SHAREHOLDER_TOP10 000001 in[2023,2022]", "STK_SHAREHOLDER_TOP10",
+     lambda m: query(m).filter(m.code == "000001.XSHE",
+                               m.end_date.in_(["2023-12-31", "2022-12-31"])),
+     True, None),
 ]
 
 
@@ -114,5 +162,33 @@ def test_finance_100codes_disclosure(sample_codes, snap):
     ok, msgs = _run(
         snap, "REPORT_DISCLOSURE 100票 end>=2021", "STK_REPORT_DISCLOSURE",
         lambda m: query(m).filter(m.code.in_(codes), m.end_date >= "2021-01-01"),
+    )
+    assert ok, " | ".join(msgs)
+
+
+def test_finance_100codes_shareholder_top10(sample_codes, snap):
+    """100 票 × 近年十大股东(高基数表,offset 分页)。"""
+    codes = sample_codes
+    ok, msgs = _run(
+        snap, "SHAREHOLDER_TOP10 100票 end>=2022", "STK_SHAREHOLDER_TOP10",
+        lambda m: query(m).filter(m.code.in_(codes), m.end_date >= "2022-01-01"),
+    )
+    assert ok, " | ".join(msgs)
+
+
+def test_finance_100codes_holder_num(sample_codes, snap):
+    codes = sample_codes
+    ok, msgs = _run(
+        snap, "HOLDER_NUM 100票 pub>=2018", "STK_HOLDER_NUM",
+        lambda m: query(m).filter(m.code.in_(codes), m.pub_date >= "2018-01-01"),
+    )
+    assert ok, " | ".join(msgs)
+
+
+def test_finance_100codes_capital_change(sample_codes, snap):
+    codes = sample_codes
+    ok, msgs = _run(
+        snap, "CAPITAL_CHANGE 100票 pub>=2018", "STK_CAPITAL_CHANGE",
+        lambda m: query(m).filter(m.code.in_(codes), m.pub_date >= "2018-01-01"),
     )
     assert ok, " | ".join(msgs)

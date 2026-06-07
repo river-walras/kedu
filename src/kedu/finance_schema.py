@@ -25,6 +25,20 @@ STK_TABLES: dict[str, str] = {
     # 市场每日成交概况 / 融资融券汇总(均以 date 为键,无 pub_date/end_date)
     "STK_EXCHANGE_TRADE_INFO": "stk_exchange_trade_info",
     "STK_MT_TOTAL": "stk_mt_total",
+    # 上市公司基本信息族(reference/上市公司基本信息):基本信息/上市信息/简称变更/员工/
+    # 股东户数/预计解禁/实际解禁/大股东增减持/股本变动/股份冻结/前十大及十大流通股东
+    "STK_COMPANY_INFO": "stk_company_info",
+    "STK_LIST": "stk_list",
+    "STK_NAME_HISTORY": "stk_name_history",
+    "STK_EMPLOYEE_INFO": "stk_employee_info",
+    "STK_HOLDER_NUM": "stk_holder_num",
+    "STK_LIMITED_SHARES_LIST": "stk_limited_shares_list",
+    "STK_LIMITED_SHARES_UNLIMIT": "stk_limited_shares_unlimit",
+    "STK_SHAREHOLDERS_SHARE_CHANGE": "stk_shareholders_share_change",
+    "STK_CAPITAL_CHANGE": "stk_capital_change",
+    "STK_SHARES_FROZEN": "stk_shares_frozen",
+    "STK_SHAREHOLDER_TOP10": "stk_shareholder_top10",
+    "STK_SHAREHOLDER_FLOATING_TOP10": "stk_shareholder_floating_top10",
 }
 
 
@@ -42,10 +56,12 @@ def _ch_from_sa(sa_type, name: str) -> str:
         return "Nullable(Float64)"
     if isinstance(sa_type, sa.Numeric):  # DECIMAL
         return "Nullable(Float64)"
+    # Date32(1900-2299)而非 Date(1970-2149):成立日期等可早于 1970,Date 会溢出
+    # (UInt16 天数上限 65535)。build_model 仍将 Date32 还原为 SQLAlchemy Date,parity 不变。
     if isinstance(sa_type, sa.DateTime):
-        return "Nullable(Date)"
+        return "Nullable(Date32)"
     if isinstance(sa_type, sa.Date):
-        return "Nullable(Date)"
+        return "Nullable(Date32)"
     return "Nullable(String)"
 
 

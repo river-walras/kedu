@@ -139,6 +139,14 @@ ORDER BY (instrument_id, date)""",
   round_lot Nullable(Float64), status Nullable(String),
   _ingested_at DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_ingested_at) ORDER BY instrument_id""",
+    # get_locked_shares 派生数据集(聚宽独立维护,非由 STK_* 表重算):day/num/rate1/rate2,
+    # 每 (code, day) 唯一(聚宽已按解禁日聚合)。由 backfill_locked_shares.py 自 live 全量灌入。
+    "locked_shares": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.locked_shares (
+  code String, day Date,
+  num Nullable(Float64), rate1 Nullable(Float64), rate2 Nullable(Float64),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+ORDER BY (code, day)""",
 }
 
 
