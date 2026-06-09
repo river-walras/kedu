@@ -1,105 +1,242 @@
-# jqdata — 聚宽 jqdatasdk 的本地 ClickHouse 复刻
+# kedu
 
-在本地 ClickHouse(库名 `jqdata`)上复刻聚宽 `jqdatasdk` 的常用接口,返回结果与线上 `jqdatasdk` **逐字段一致**,且无网络/配额依赖。数据由脚本从聚宽拉取后落库,查询全部走本地 ClickHouse。
+本项目在本地 ClickHouse 上复刻聚宽 `jqdatasdk` 的常用 API。查询全部走本地库 `jqdata`，不依赖在线接口；数据由回补脚本从聚宽拉取后落库。
 
-## 已复刻的接口(`jqdata`)
+当前包名是 `kedu`，不是 `jqdata`：
 
 ```python
-from jqdata import (
-    auth,                              # 设定 ClickHouse 凭证(仿 jqdatasdk.auth)
-    get_fundamentals,                  # 单日/单报告期基本面
-    get_fundamentals_continuously,     # 多交易日基本面
-    get_history_fundamentals,          # 多季/多年报告期
-    finance,                           # finance.run_query / run_offset_query / get_table_info(STK_* 原始报告期表)
-    get_price,                         # 行情(单标的或 list;frequency='daily' 读 bar_1d / '1m' 读 bar_1m;前/后/不复权)
-    get_trade_days, get_all_trade_days,# 交易日历
-    get_all_securities,                # 证券列表(股票)
-    query, income, balance, cash_flow, indicator, valuation,
+from kedu import auth, query, valuation, get_price, get_fundamentals
+
+auth("default", "<password>")
+df = get_fundamentals(query(valuation).limit(5), date="2024-05-10")
+```
+
+## 已经复刻可用的 API
+
+### 认证与查询表面
+
+```python
+from kedu import (
+    auth,
+    auth_from_env,
+    get_client,
+    query,
+    income,
+    balance,
+    cash_flow,
+    indicator,
+    valuation,
 )
-
-auth("default", "<password>")          # 或先 export 环境变量后 jqdata.auth_from_env()
-df = get_fundamentals(query(valuation, income), date="2022-01-11")
 ```
 
-> `get_client()` 在未 `auth()` 时直接报错——不静默回退环境变量。脚本/pm2 用 `auth_from_env()` 显式从 `CLICKHOUSE_*` 环境变量拉起。
+### 基本面
 
-## 目录结构
-
-```
-src/jqdata/        # 包:接口实现(db/auth、fundamentals、finance、prices、calendar、securities、schema 等)
-scripts/            # 建库 + 更新脚本
-  rebuild_from_jq.py        # 全量重建(基本面 + 日线行情)
-  backfill_stk.py           # STK_* 原始报告期表(finance.run_query 底表)幂等同步
-  backfill_jq.py            # 基本面/估值回补 + 交易日历同步(--trade-days)
-  update_jqdata.py          # 盘后增量更新(pm2 入口;trade_days→securities→基本面→估值→行情→STK_*)
-  status.py                 # 各表数据新鲜度核查
-  import_factors_to_clickhouse.py / check_missing_factor_stocks.py   # 因子表(独立数据,非复刻接口)
-tests/              # pytest 用例和线上校验实现
-reference/          # 字段/规则 schema 文档
-ecosystem.config.js # pm2 调度(盘后增量)
+```python
+from kedu import (
+    get_fundamentals,
+    get_fundamentals_continuously,
+    get_history_fundamentals,
+)
 ```
 
-## 安装与配置
+### 行情
+
+```python
+from kedu import get_price
+```
+
+已支持：
+
+- `frequency='daily'`
+- `frequency='1m'`，前提是本地已回补 `bar_1m`
+- `fq=None`、`fq='post'`、`fq='pre'`
+- 股票、指数、场内基金日线；分钟线按已入库标的可查
+
+### 交易日历与证券列表
+
+```python
+from kedu import get_trade_days, get_all_trade_days, get_all_securities
+```
+
+`get_all_securities` 已覆盖：
+
+- `stock`
+- `index`
+- `fund`
+- `etf`
+- `lof`
+- `fja`
+
+其中 `fund` 会展开到场内基金细分类型。
+
+### finance 模块
+
+```python
+from kedu import finance, get_table_info
+```
+
+已支持：
+
+- `finance.run_query`
+- `finance.run_offset_query`
+- `finance.get_table_info`
+- 顶层别名 `get_table_info`
+
+已复刻的 `finance` 表：
+
+- 股票报告期/公告类：
+  `STK_INCOME_STATEMENT`,
+  `STK_BALANCE_SHEET`,
+  `STK_CASHFLOW_STATEMENT`,
+  `STK_CASH_FLOW_STATEMENT`,
+  `STK_FIN_FORCAST`,
+  `STK_AUDIT_OPINION`,
+  `STK_REPORT_DISCLOSURE`,
+  `STK_STATUS_CHANGE`,
+  `STK_EXCHANGE_TRADE_INFO`,
+  `STK_MT_TOTAL`
+- 上市公司基本信息类：
+  `STK_COMPANY_INFO`,
+  `STK_LIST`,
+  `STK_NAME_HISTORY`,
+  `STK_EMPLOYEE_INFO`,
+  `STK_HOLDER_NUM`,
+  `STK_LIMITED_SHARES_LIST`,
+  `STK_LIMITED_SHARES_UNLIMIT`,
+  `STK_SHAREHOLDERS_SHARE_CHANGE`,
+  `STK_CAPITAL_CHANGE`,
+  `STK_SHARES_FROZEN`,
+  `STK_SHAREHOLDER_TOP10`,
+  `STK_SHAREHOLDER_FLOATING_TOP10`
+- 基金类：
+  `FUND_MAIN_INFO`,
+  `FUND_NET_VALUE`,
+  `FUND_FIN_INDICATOR`,
+  `FUND_PORTFOLIO`,
+  `FUND_PORTFOLIO_BOND`,
+  `FUND_PORTFOLIO_STOCK`,
+  `FUND_INVEST_TARGET`,
+  `FUND_DIVIDEND`,
+  `FUND_SHARE_DAILY`,
+  `FUND_MF_DAILY_PROFIT`
+
+### 行业、概念、指数
+
+```python
+from kedu import (
+    get_industries,
+    get_industry_stocks,
+    get_history_industry,
+    get_industry,
+    get_concepts,
+    get_concept_stocks,
+    get_concept,
+    get_index_stocks,
+    get_index_weights,
+    get_index_valuation,
+)
+```
+
+### 融资融券、解禁、额外字段
+
+```python
+from kedu import (
+    get_mtss,
+    get_margincash_stocks,
+    get_marginsec_stocks,
+    get_locked_shares,
+    get_extras,
+)
+```
+
+`get_extras` 当前只支持这些 `info`：
+
+- `is_st`
+- `unit_net_value`
+- `acc_net_value`
+- `adj_net_value`
+
+## 安装
 
 ```bash
-uv sync                        # 创建 venv、装依赖、editable 安装本包(src 布局)
-cp .env.example .env           # 填入 ClickHouse 与 JoinQuant 凭证(.env 已被 gitignore)
+uv sync
 ```
 
-需要凭证的脚本统一用 env-file 注入运行:
+## 认证
 
-```bash
-uv run --env-file .env python scripts/status.py
+交互式使用：
+
+```python
+from kedu import auth
+
+auth("default", "<clickhouse_password>")
 ```
 
-## 建库(首次)
+脚本使用环境变量：
 
 ```bash
-uv run --env-file .env python scripts/rebuild_from_jq.py --fundamentals --bars   # 基本面 + 日线行情
-uv run --env-file .env python scripts/backfill_stk.py                            # STK_* 报告期表
-uv run --env-file .env python scripts/backfill_jq.py --trade-days                # 交易日历
+export CLICKHOUSE_USER=default
+export CLICKHOUSE_PASSWORD=your_password
+export CLICKHOUSE_HOST=localhost
+export CLICKHOUSE_PORT=8123
+export CLICKHOUSE_DATABASE=jqdata
 ```
 
-分钟线 bar_1m 量巨大(全市场每交易日 ~132 万行,全历史数十亿行),单独回补、可断点续跑(按 标的×年 跳过已存在):
+然后在脚本里：
 
-```bash
-# 全历史(极重、配额巨大,建议后台 + 分批;可用 --bars-1m-year 单年、--limit-codes 测试)
-uv run --env-file .env python scripts/rebuild_from_jq.py --bars-1m
-uv run --env-file .env python scripts/rebuild_from_jq.py --bars-1m --bars-1m-year 2026   # 单年批
+```python
+from kedu import auth_from_env
+
+auth_from_env()
 ```
 
-## 增量更新(每日盘后)
+`get_client()` 在未认证时会直接报错，不会静默读取环境变量。
 
-由 pm2 调度 `scripts/update_jqdata.py`(北京时间 18:30 盘后;服务器为 UTC,故 cron 用 `30 10 * * 1-5`):步骤 = trade_days → securities → 报告期基本面 → 估值 → bar_1d → STK_* → OPTIMIZE → **bar_1m(最后,最重)**。
+## 常用命令
 
 ```bash
-pm2 start ecosystem.config.js && pm2 save     # 首次注册并持久化
-pm2 logs jqdata-update                         # 看日志
+UV_CACHE_DIR=/tmp/uv uv run pytest
+UV_CACHE_DIR=/tmp/uv uv run ruff check .
+UV_CACHE_DIR=/tmp/uv uv run ruff format .
 ```
 
-> `bar_1m` 增量随每日更新追加(`--skip-bars-1m` 可关);空表时只从当日起,不在每日更新里回补历史(历史走上面的 `rebuild_from_jq.py --bars-1m`)。
-
-## 校验(与线上逐字段一致)
-
-测试按值校验本地结果与线上 `jqdatasdk` 逐字段一致。抽查策略:基本面/finance/history 用
-固定代表股+确定性均匀抽样 100 票;日线按 `--price-scale`(默认 heavy=50 票,窗口由本地
-factor 变化推导的除权事件窗口构成);日历/证券列表在 JQ 不计配额,放开覆盖。
-
-**快照缓存**:首次跑把 live 响应落盘 `tests/_snapshots/`(已 gitignore),重跑命中缓存=0
-配额;`--refresh-snapshots` 强制重拉。纯命中跑只需 ClickHouse 凭证。会话末打印实际 live
-调用次数与剩余 `get_query_count()`。
+单测示例：
 
 ```bash
-# 首次:落快照(消耗 JQ 配额,约数万条;末尾打印实际配额)
-uv run --env-file .env pytest tests -q --refresh-snapshots
-# 之后重跑:命中缓存,0 配额
-uv run --env-file .env pytest tests -q
+UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_fundamentals.py -xvs
+UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_index.py -xvs
+```
 
-uv run --env-file .env pytest tests/test_calendar.py tests/test_securities.py -q   # 交易日历 + 证券列表(免费)
-uv run --env-file .env pytest tests/test_fundamentals.py -q                        # get_fundamentals 严格值校验
-uv run --env-file .env pytest tests/test_finance.py -q                             # finance.run_query / STK_*
-uv run --env-file .env pytest tests/test_history.py -q                             # continuously / history
-uv run --env-file .env pytest tests/test_price.py -q --price-scale medium          # 日线(可调档位)
-# bar_1m 未入库,默认 skip;先回补窗口后显式启用:
-uv run --env-file .env pytest tests/test_bars_1m.py --run-bars-1m --bars-1m-start 2026-05-26 --bars-1m-end 2026-05-29
+## 数据回补脚本
+
+仓库内常用脚本：
+
+- `scripts/rebuild_from_jq.py`：全量回补基本面、日线、可选分钟线
+- `scripts/backfill_stk.py`：回补 `finance` 的股票类表
+- `scripts/backfill_fund.py`：回补基金类表、基金日线
+- `scripts/backfill_index.py`：回补指数成分、权重、估值
+- `scripts/backfill_industry.py`：回补行业、概念及其历史成分
+- `scripts/backfill_margin.py`：回补融资融券数据
+- `scripts/backfill_locked_shares.py`：回补限售解禁数据
+- `scripts/backfill_jq.py`：回补交易日历、估值、`is_st` 等
+- `scripts/update_jqdata.py`：盘后增量更新入口
+- `scripts/status.py`：检查各表新鲜度
+
+## 校验
+
+测试会把本地结果和线上 `jqdatasdk` 逐字段比对。已覆盖的模块包括：
+
+- 基本面三组接口
+- `finance.run_query` / `run_offset_query`
+- `get_price` 日线、基金日线、可选分钟线
+- 交易日历、证券列表
+- 行业、概念、指数
+- 融资融券
+- `get_locked_shares`
+- `get_extras`
+
+运行全部测试：
+
+```bash
+UV_CACHE_DIR=/tmp/uv uv run pytest
 ```
