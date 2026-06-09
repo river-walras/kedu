@@ -31,7 +31,16 @@ CASES = [
     (dict(date="2020-10-10"), "date=2020-10-10"),
     (dict(date="2024-05-10"), "date=2024-05-10"),
     (dict(types=["stock"], date="2013-03-15"), "['stock'] @2013-03-15"),
+    # 场内基金:伞型 'fund' 展开 + 细分类型直接过滤(type 列 parity 验证伞型展开)
+    (dict(types=["fund"]), "get_all_securities(['fund'])"),
+    (dict(types=["etf"]), "get_all_securities(['etf'])"),
+    (dict(types=["lof"]), "get_all_securities(['lof'])"),
+    (dict(types=["fja"]), "get_all_securities(['fja'])"),
+    (dict(types=["fund"], date="2021-06-30"), "['fund'] @2021-06-30"),
 ]
+
+# 聚宽不接受 mmf/reits/fjm 作 types 参数(只能经 ['fund'] 过滤)-> 本地复刻同款报错。
+INVALID_TYPES = ["mmf", "reits", "fjm"]
 
 
 @pytest.mark.parametrize("kw,label", CASES, ids=[c[1] for c in CASES])
@@ -40,3 +49,12 @@ def test_get_all_securities(kw, label):
     live = jqdatasdk.get_all_securities(**kw)
     ok, issues = secdf_compare(local, live, label)
     assert ok, f"{label} 不一致: " + " | ".join(issues)
+
+
+@pytest.mark.parametrize("t", INVALID_TYPES, ids=INVALID_TYPES)
+def test_get_all_securities_invalid_type_raises(t):
+    """mmf/reits/fjm 非法参数:本地与 live 均报错(parity)。"""
+    with pytest.raises(Exception):
+        jqdatasdk.get_all_securities(types=[t])
+    with pytest.raises(Exception):
+        kedu.get_all_securities(types=[t])

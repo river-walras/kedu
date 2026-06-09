@@ -41,6 +41,43 @@ STK_TABLES: dict[str, str] = {
     "STK_SHAREHOLDER_FLOATING_TOP10": "stk_shareholder_floating_top10",
 }
 
+# 基金族(reference/基金):同样走 finance.run_query,与 STK 共用同步引擎与建表辅助。
+# 这些是聚宽真实 finance 表,backfill 据 jqdatasdk 模型列类型建表(见 backfill_stk/backfill_fund)。
+FUND_TABLES: dict[str, str] = {
+    "FUND_MAIN_INFO": "fund_main_info",
+    "FUND_NET_VALUE": "fund_net_value",
+    "FUND_FIN_INDICATOR": "fund_fin_indicator",
+    "FUND_PORTFOLIO": "fund_portfolio",
+    "FUND_PORTFOLIO_BOND": "fund_portfolio_bond",
+    "FUND_PORTFOLIO_STOCK": "fund_portfolio_stock",
+    "FUND_INVEST_TARGET": "fund_invest_target",
+    "FUND_DIVIDEND": "fund_dividend",
+    "FUND_SHARE_DAILY": "fund_share_daily",
+    "FUND_MF_DAILY_PROFIT": "fund_mf_daily_profit",
+}
+
+# finance.run_query 可见的全部逻辑表(STK + 基金)。命名避开 backfill_stk 内的局部
+# FINANCE_TABLES(那是旧的 finance_income_statement/balance/cashflow 三张表常量)。
+RUN_QUERY_TABLES: dict[str, str] = {**STK_TABLES, **FUND_TABLES}
+
+# 基金同步表(去别名;基金无别名,即 FUND_TABLES 全集)。集中放此处,供 update_jqdata
+# 与 backfill_fund 共用,依赖单向(脚本 → finance_schema),杜绝循环 import。
+FUND_SYNC_TABLES: list[str] = list(FUND_TABLES)
+
+# 场内基金细分类型:get_all_securities(['fund']) 返回的 type 取值,均有行情 bar
+# (与股票/指数同进 bar_1d/bar_1m)。场外(.OF)基金不在此列。亦作伞型 'fund' 的展开集。
+# 单一来源,供 securities.py(伞型展开)、update_jqdata.py、rebuild_from_jq.py(bar 范围)共用。
+FUND_ONEXCHANGE_TYPES: tuple[str, ...] = ("etf", "lof", "mmf", "reits", "fja", "fjb", "fjm")
+
+# 物理表排序键覆盖:默认 ORDER BY id(报告期表一码多行、靠 id 唯一)。基金逐日大表
+# 常按 (code, 日期) 查,ORDER BY id 会全表扫 -> 改排序键(同时即 ReplacingMergeTree
+# 去重键;这些表每 (code, 日期) 唯一,语义不变)。
+ORDER_BY_OVERRIDE: dict[str, str] = {
+    "fund_net_value": "(code, day)",
+    "fund_share_daily": "(code, date)",
+    "fund_mf_daily_profit": "(code, end_date)",
+}
+
 
 def _ch_from_sa(sa_type, name: str) -> str:
     """将 SQLAlchemy 列类型映射为 ClickHouse 类型.
@@ -73,11 +110,20 @@ def schema_from_model(model) -> list[tuple[str, str]]:
     return [(c.name, _ch_from_sa(c.type, c.name)) for c in model.__table__.columns]
 
 
-def new_table_ddl(ch_table: str, schema: list[tuple[str, str]]) -> str:
-    """根据 schema 生成新表 DDL."""
+def new_table_ddl(ch_table: str, schema: list[tuple[str, str]],
+                  order_by: str | None = None) -> str:
+    """根据 schema 生成新表 DDL.
+
+    order_by 缺省取 ORDER_BY_OVERRIDE 中该表的排序键, 再缺省回落 'id'
+    (报告期表一码多行靠 id 唯一;基金逐日大表用 (code, 日期) 提升按码查询).
+    """
     cols = ",\n  ".join(f"`{c}` {t}" for c, t in schema)
+    ob = order_by or ORDER_BY_OVERRIDE.get(ch_table, "id")
+    # 非 id 排序键(基金大表的 (code, 日期))列为 Nullable, 需开启 allow_nullable_key;
+    # id 排序键(Int64 非空)无此问题, 保持 STK DDL 不变。
+    settings = "" if ob == "id" else "\nSETTINGS allow_nullable_key = 1"
     return f"""CREATE TABLE IF NOT EXISTS {DATABASE}.{ch_table} (
   {cols},
   _ingested_at DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_ingested_at)
-ORDER BY id"""
+ORDER BY {ob}{settings}"""

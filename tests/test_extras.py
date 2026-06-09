@@ -60,9 +60,10 @@ def test_get_extras_100codes(sample_codes, snap):
     assert ok, " | ".join(msgs)
 
 
-def test_get_extras_rejects_non_is_st():
+def test_get_extras_rejects_unsupported_info():
+    """不支持的 info(非 is_st、非基金净值)仍报 NotImplementedError。"""
     with pytest.raises(NotImplementedError):
-        kedu.get_extras("acc_net_value", ["000001.XSHE"], start_date="2020-01-01")
+        kedu.get_extras("futures_positions", ["000001.XSHE"], start_date="2020-01-01")
 
 
 def test_get_extras_df_false_dict(snap, clickhouse_auth):

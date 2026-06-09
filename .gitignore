@@ -1,6 +1,10 @@
 # Secrets / local config
 .env
 
+# Local agent/session state (large)
+.claude/
+.codex/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -4,9 +4,11 @@
 get_price(fq='post').factor, 见 scripts/rebuild_from_jq.py, 故基准与聚宽后复权一致.
 - 不复权, fq=None: 原样返回, factor 列为 1.
 - 后复权, fq='post': adj=raw*factor, 量=raw/factor, factor 列为 factor.
-  基准同聚宽, 绝对值与聚宽一致, 价格列 round(2) 可能引入约 0.01 舍入差.
+  基准同聚宽, 绝对值与聚宽一致, 价格列 round 可能引入舍入差.
 - 前复权, fq='pre': adj=raw*factor/factor_last, 量=raw*factor_last/factor,
   factor 列为 factor/factor_last. 最新交易日为原始价, 与聚宽一致.
+- 复权价/均价 round 位数:股票 2 位、基金 3 位(对齐聚宽, 实测 P0d);量取整。
+  基金身份由 securities.type ∈ 场内基金类型即时判定(无长缓存, 避免 securities 刷新后 stale)。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .db import DATABASE, get_client, query_df
+from .finance_schema import FUND_ONEXCHANGE_TYPES
 
 _PRICE_FIELDS = ["open", "close", "high", "low", "pre_close", "high_limit", "low_limit", "avg"]
 _DEFAULT_FIELDS = ["open", "close", "high", "low", "volume", "money"]
@@ -35,6 +38,21 @@ def _is_date_only(v) -> bool:
 
 _SEL_COLS = ["instrument_id", "open", "close", "high", "low", "pre_close",
              "high_limit", "low_limit", "volume", "money", "avg", "factor", "paused"]
+
+
+def _fund_codes(cli, codes: Sequence[str]) -> set[str]:
+    """即时查 securities,返回 codes 中属于场内基金(type ∈ FUND_ONEXCHANGE_TYPES)的代码集。
+
+    无长生命周期缓存,避免 securities 刷新后判定 stale。仅在复权 round 时调用一次。
+    """
+    if not codes:
+        return set()
+    inlist = ", ".join("'" + str(c).replace("'", "") + "'" for c in codes)
+    tin = ", ".join("'" + t + "'" for t in FUND_ONEXCHANGE_TYPES)
+    rows = cli.query(
+        f"SELECT instrument_id FROM {DATABASE}.securities "
+        f"WHERE instrument_id IN ({inlist}) AND type IN ({tin})").result_rows
+    return {r[0] for r in rows}
 
 
 def get_price(security: str | Sequence[str], start_date: str | dt.date | None = None,
@@ -131,14 +149,21 @@ def get_price(security: str | Sequence[str], start_date: str | dt.date | None = 
     else:
         raise ValueError(f"bad fq: {fq}")
 
-    # 复权时聚宽把价格/量 round 到 2 位/整股;不复权(fq=None)则原样返回存储精度
+    # 复权时聚宽把价格/量 round 到固定位数/整股;不复权(fq=None)则原样返回存储精度
     # (OHLC 原生 2 位,avg 为成交均价原生 3 位 —— 不能强行 round 到 2 位)。
+    # round 位数:股票 2 位、基金 3 位(逐行按 securities.type 判定,即时查无 stale)。
     adjust = fq is not None
+    fund_mask = (df["instrument_id"].isin(_fund_codes(cli, codes)).to_numpy()
+                 if (adjust and round) else None)
     cols: dict[str, object] = {}
     for fld in fields:
         if fld in _PRICE_FIELDS:
             v = df[fld].astype("float64") * adj if adjust else df[fld].astype("float64")
-            cols[fld] = v.round(2).to_numpy() if (adjust and round) else v.to_numpy()
+            if adjust and round:
+                vv = v.to_numpy()
+                cols[fld] = np.where(fund_mask, np.round(vv, 3), np.round(vv, 2))
+            else:
+                cols[fld] = v.to_numpy()
         elif fld == "volume":
             v = df["volume"].astype("float64") / adj if adjust else df["volume"].astype("float64")
             cols[fld] = (v.round() if (adjust and round) else v).to_numpy()

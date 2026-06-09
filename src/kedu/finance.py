@@ -18,7 +18,7 @@ from sqlalchemy import text
 from ._jqsdk import SqlQuery, compile_query
 from .db import get_client, query_df
 from .finance_models import build_model
-from .finance_schema import STK_TABLES
+from .finance_schema import RUN_QUERY_TABLES
 from .fundamentals import _strip_table_prefix, _to_clickhouse_sql
 
 def _convert_series(s: pd.Series) -> pd.Series:
@@ -76,14 +76,14 @@ class _Finance:
     """聚宽 finance 模块的本地替身."""
 
     def __getattr__(self, name: str):
-        """按需构建并返回 STK_* 表模型."""
-        if name in STK_TABLES:
+        """按需构建并返回 STK_* / FUND_* 表模型."""
+        if name in RUN_QUERY_TABLES:
             return build_model(name)
         raise AttributeError(f"finance has no table {name!r}")
 
     def __dir__(self):
-        """返回对象默认属性与可用 STK_* 表名."""
-        return list(super().__dir__()) + list(STK_TABLES)
+        """返回对象默认属性与可用 STK_* / FUND_* 表名."""
+        return list(super().__dir__()) + list(RUN_QUERY_TABLES)
 
     def run_query(self, query_object: SqlQuery) -> pd.DataFrame:
         """执行 finance 查询并返回完整结果.

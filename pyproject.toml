@@ -1,6 +1,6 @@
 [project]
 name = "kedu"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local ClickHouse replica of JoinQuant jqdatasdk APIs (get_fundamentals / get_price / finance.run_query / 交易日历 / 证券列表)"
 readme = "README.md"
 requires-python = ">=3.11"

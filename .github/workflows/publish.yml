@@ -1,0 +1,54 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]   # 在 GitHub 上发布一个 Release 即触发
+  workflow_dispatch: {}   # 也允许手动触发
+
+jobs:
+  # 跨平台构建 + 安装验证（无测试）
+  build-check:
+    name: build-check (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Install built wheel (smoke check)
+        shell: bash
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+          uv run python -c "import kedu; print('kedu import OK')"
+
+  # 全部平台通过后，构建一次并发布到 PyPI
+  publish:
+    name: Publish to PyPI
+    needs: build-check
+    runs-on: ubuntu-latest
+    environment: pypi          # 可选：配合 GitHub Environment 做保护
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish

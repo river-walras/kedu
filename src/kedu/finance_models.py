@@ -13,7 +13,7 @@ from sqlalchemy import BigInteger, Column, Date, DateTime, Float, Numeric, Strin
 from sqlalchemy.orm import declarative_base
 
 from .db import DATABASE, get_client
-from .finance_schema import STK_TABLES
+from .finance_schema import RUN_QUERY_TABLES
 
 _Base = declarative_base()
 _CACHE: dict[str, type] = {}
@@ -44,9 +44,9 @@ def build_model(jq_name: str) -> type:
     按 ClickHouse 物理表名缓存,使别名(如 STK_CASHFLOW_STATEMENT /
     STK_CASH_FLOW_STATEMENT)复用同一映射类, 避免 SQLAlchemy 重复定义同表.
     """
-    if jq_name not in STK_TABLES:
+    if jq_name not in RUN_QUERY_TABLES:
         raise AttributeError(jq_name)
-    ch = STK_TABLES[jq_name]
+    ch = RUN_QUERY_TABLES[jq_name]
     if ch in _CACHE:
         return _CACHE[ch]
     desc = get_client().query(f"DESCRIBE {DATABASE}.`{ch}`").result_rows

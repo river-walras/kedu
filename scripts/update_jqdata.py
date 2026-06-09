@@ -25,12 +25,16 @@ from jqdatasdk import (get_all_securities, get_query_count, get_trade_days,  # n
                        income, balance, indicator, cash_flow)
 
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
+from kedu.finance_schema import FUND_ONEXCHANGE_TYPES, FUND_SYNC_TABLES  # noqa: E402
 import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
 import scripts.backfill_index as bx  # noqa: E402
 import scripts.backfill_margin as bm  # noqa: E402
 import scripts.backfill_locked_shares as bls  # noqa: E402
+
+# 支持日/分钟行情的 type(bar_1d/bar_1m 取价范围):股票 + 指数 + 场内基金。
+BAR_TYPES = ("stock", "index", *FUND_ONEXCHANGE_TYPES)
 
 
 def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
@@ -48,13 +52,18 @@ def recent_quarters(n_quarters: int = 8) -> tuple[list[str], list[str]]:
 
 
 def update_securities(client) -> None:
-    """股票 + 指数一并落 securities(type 区分)。指数供 get_all_securities(['index'])、
-    指数日线(update_bars 无 type 过滤自动带上)与指数成分/权重/估值宇宙使用。"""
+    """股票 + 指数 + 场内基金一并落 securities(type 区分)。指数供 get_all_securities(['index'])、
+    场内基金供 get_all_securities(['fund']/['etf']...);三者日线由 update_bars(按 BAR_TYPES)带上,
+    指数成分/权重/估值宇宙用 type='index'。"""
     parts = []
     for t in ("stock", "index"):
         d = get_all_securities([t]).reset_index().rename(columns={"index": "instrument_id"})
-        d["type"] = t
+        d["type"] = t   # 股票/指数:统一 type
         parts.append(d)
+    # 场内基金:get_all_securities(['fund']) 已带细分类 type(etf/lof/mmf/reits/fja/fjb/fjm),
+    # 必须**保留**该 type、不覆盖,否则 get_all_securities(['etf'] 等)的 parity 会崩。
+    fd = get_all_securities(["fund"]).reset_index().rename(columns={"index": "instrument_id"})
+    parts.append(fd)
     df = pd.concat(parts, ignore_index=True)
     df["start_date"] = pd.to_datetime(df["start_date"]).dt.date
     df["end_date"] = pd.to_datetime(df["end_date"]).dt.date
@@ -66,22 +75,49 @@ def update_securities(client) -> None:
     client.command(f"TRUNCATE TABLE {DATABASE}.securities")
     client.insert_df(f"{DATABASE}.securities", df[cols])
     n_idx = int((df["type"] == "index").sum())
-    print(f"  securities: {len(df)}(stock {len(df) - n_idx} / index {n_idx})")
+    n_stk = int((df["type"] == "stock").sum())
+    n_fund = int(df["type"].isin(FUND_ONEXCHANGE_TYPES).sum())
+    print(f"  securities: {len(df)}(stock {n_stk} / index {n_idx} / 场内基金 {n_fund})")
+
+
+_BAR_PF = ["open", "close", "high", "low", "pre_close", "high_limit", "low_limit", "volume", "money", "avg", "paused"]
+
+
+def _pull_day_bars(codes: list[str], d: str):
+    """单日拉 raw(fq=None) + factor(fq='post');整批 get_price 失败则二分降级,
+    防某些细分类(如部分基金)返回异常拖垮整批。返回 (raw_df, fac_df),失败码自动剔除。"""
+    try:
+        raw = jqdatasdk.get_price(codes, end_date=d, count=1, frequency="daily", fields=_BAR_PF,
+                                  fq=None, panel=False, skip_paused=False)
+        fac = jqdatasdk.get_price(codes, end_date=d, count=1, frequency="daily", fields=["factor"],
+                                  fq="post", panel=False, skip_paused=False)
+        return raw, fac
+    except Exception as e:  # noqa: BLE001
+        if len(codes) <= 1:
+            print(f"  bar_1d {d} {codes}: 跳过(失败 {type(e).__name__}: {str(e)[:80]})", flush=True)
+            return None, None
+        mid = len(codes) // 2
+        r1, f1 = _pull_day_bars(codes[:mid], d)
+        r2, f2 = _pull_day_bars(codes[mid:], d)
+        raws = [x for x in (r1, r2) if x is not None and not x.empty]
+        facs = [x for x in (f1, f2) if x is not None and not x.empty]
+        return (pd.concat(raws, ignore_index=True) if raws else None,
+                pd.concat(facs, ignore_index=True) if facs else None)
 
 
 def update_bars(client, start: str, end: str) -> None:
     """逐交易日增量写 bar_1d:fq=None 原始价 + fq='post' 后复权因子(聚宽口径)。
 
-    后复权因子以 IPO 为基准、随时间累乘,新除权只抬高其后日期的因子,历史日不变,
-    故按日增量拉取即可,无需回改历史。"""
+    覆盖股票/指数/场内基金(securities 中 type ∈ BAR_TYPES)。后复权因子以 IPO 为基准、随时间
+    累乘,新除权只抬高其后日期的因子,历史日不变,故按日增量拉取即可,无需回改历史。"""
     days = [d.strftime("%Y-%m-%d") for d in get_trade_days(start_date=start, end_date=end)]
     if not days:
         print("  bar_1d: up to date")
         return
+    inlist = ", ".join(f"'{t}'" for t in BAR_TYPES)
     windows = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"ORDER BY instrument_id").result_rows
-    pf = ["open", "close", "high", "low", "pre_close", "high_limit", "low_limit", "volume", "money", "avg", "paused"]
+        f"WHERE type IN ({inlist}) ORDER BY instrument_id").result_rows
     out = ["instrument_id", "date", "open", "close", "high", "low", "pre_close",
            "high_limit", "low_limit", "volume", "money", "avg", "factor", "paused", "is_st"]
     total = 0
@@ -93,15 +129,16 @@ def update_bars(client, start: str, end: str) -> None:
         ]
         if not codes:
             continue
-        raw = jqdatasdk.get_price(codes, end_date=d, count=1, frequency="daily", fields=pf,
-                                  fq=None, panel=False, skip_paused=False)
-        fac = jqdatasdk.get_price(codes, end_date=d, count=1, frequency="daily", fields=["factor"],
-                                  fq="post", panel=False, skip_paused=False)
+        raw, fac = _pull_day_bars(codes, d)
         if raw is None or raw.empty:
             continue
         raw = raw.rename(columns={"code": "instrument_id", "time": "date"})
-        fac = fac.rename(columns={"code": "instrument_id", "time": "date"})
-        m = raw.merge(fac[["instrument_id", "factor"]], on="instrument_id", how="left")
+        fac = fac.rename(columns={"code": "instrument_id", "time": "date"}) if fac is not None else None
+        if fac is not None and not fac.empty:
+            m = raw.merge(fac[["instrument_id", "factor"]], on="instrument_id", how="left")
+        else:
+            m = raw.copy()
+            m["factor"] = 1.0
         m = m[m["close"].notna()].copy()
         m["date"] = pd.to_datetime(m["date"]).dt.date
         m["paused"] = m["paused"].fillna(0).astype("uint8")
@@ -126,9 +163,12 @@ def update_bars_1m(client, today: str, min_spare: int = 2_000_000) -> None:
     当前数据状态(票要么全历史齐、要么完全缺)满足此前提。"""
     today_d = dt.date.fromisoformat(today)
     REQ_START = dt.date(2005, 1, 1)
+    # 股票 + 场内基金(均有分钟线);指数不入 bar_1m(沿历史口径)。无分钟线的细分类(如部分 mmf)
+    # get_price 返回空、自动跳过。
+    bar1m_types = ", ".join(f"'{t}'" for t in ("stock", *FUND_ONEXCHANGE_TYPES))
     secs = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"WHERE type='stock' ORDER BY instrument_id").result_rows
+        f"WHERE type IN ({bar1m_types}) ORDER BY instrument_id").result_rows
     maxmap = dict(client.query(
         f"SELECT instrument_id, max(datetime) FROM {DATABASE}.bar_1m "
         f"GROUP BY instrument_id").result_rows)
@@ -192,6 +232,9 @@ def main() -> None:
     p.add_argument("--skip-bars", action="store_true", help="跳过 bar_1d 行情线更新")
     p.add_argument("--skip-bars-1m", action="store_true", help="跳过 bar_1m 分钟线更新")
     p.add_argument("--skip-stk", action="store_true", help="跳过 STK 报告期原始表(finance.run_query 底表)增量")
+    p.add_argument("--skip-fund-finance", action="store_true",
+                   help="仅跳过 10 张基金 finance.run_query 底表(FUND_*)增量;"
+                        "场内基金 securities 仍随 step1 加载、基金 bar 随 --skip-bars/--skip-bars-1m 控制")
     p.add_argument("--skip-is-st", action="store_true", help="跳过 is_st(ST 状态)增量")
     p.add_argument("--skip-industry", action="store_true", help="跳过行业/概念分类刷新(industries/industry_history/concepts/concept_history)")
     p.add_argument("--skip-index", action="store_true", help="跳过指数成分/权重/估值增量(index_member_history/index_weights/index_valuation)")
@@ -254,6 +297,12 @@ def main() -> None:
         print("== 5) STK 报告期原始表同步 (finance.run_query 底表;空表→全量,有数据→增量) ==")
         stk.sync_all(client, overlap_days=args.stk_overlap_days)
 
+    if not args.skip_fund_finance:
+        # 基金 finance.run_query 底表(FUND_*):与 STK 同一引擎(空表→全量 from 2005,有数据→增量)。
+        # FUND_NET_VALUE 等逐日大表配额重,首次种子建议先单独跑 scripts/backfill_fund.py。
+        print("== 5.5) 基金 finance.run_query 底表同步 (FUND_*;空表→全量 from 1998,有数据→增量) ==")
+        stk.sync_all(client, tables=FUND_SYNC_TABLES, start_year=1998, overlap_days=args.stk_overlap_days)
+
     if not args.skip_industry:
         # 行业/概念:与 backfill_industry.py 同一条 sync() 路径(列表 + 逐股 walk 续传到 today + 折叠)。
         # 历史没补完会在此续传(配额不足优雅停止、重跑续传);补完后每天只补新交易日。
@@ -281,12 +330,17 @@ def main() -> None:
         print("== 6.9) 限售解禁数据集刷新(locked_shares 全量重拉)==")
         bls.backfill(client, refresh=True, min_spare=args.min_spare)
 
-    for t in ("trade_days", "income_statement", "income_statement_acc", "balance_sheet",
-              "cash_flow_statement", "cash_flow_statement_acc",
-              "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
-              "industries", "industry_history", "concepts", "concept_history",
-              "index_member_history", "index_weights", "index_valuation", "index_sync_state",
-              "mtss", "margin_target_history"):
+    optimize = ["trade_days", "income_statement", "income_statement_acc", "balance_sheet",
+                "cash_flow_statement", "cash_flow_statement_acc",
+                "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
+                "industries", "industry_history", "concepts", "concept_history",
+                "index_member_history", "index_weights", "index_valuation", "index_sync_state",
+                "mtss", "margin_target_history"]
+    if not args.skip_fund_finance:   # 仅当本轮同步了基金表(否则首跑时表未建,OPTIMIZE 会报错)
+        optimize += ["fund_main_info", "fund_net_value", "fund_fin_indicator", "fund_portfolio",
+                     "fund_portfolio_bond", "fund_portfolio_stock", "fund_invest_target",
+                     "fund_dividend", "fund_share_daily", "fund_mf_daily_profit"]
+    for t in optimize:
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。

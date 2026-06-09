@@ -29,8 +29,13 @@ import jqdatasdk  # noqa: E402
 from jqdatasdk import auth, get_query_count, query, income, balance  # noqa: E402
 
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
+from kedu.finance_schema import FUND_ONEXCHANGE_TYPES  # noqa: E402
 from kedu.schema import (MARKET_DDL, data_columns,  # noqa: E402
                             day_view_ddl, statdate_table_ddl)
+
+# 与日更口径一致:bar_1d 含股票/指数/场内基金;bar_1m 仅股票/场内基金(指数不入分钟线)。
+_BAR_TYPES_SQL = ", ".join(f"'{t}'" for t in ("stock", "index", *FUND_ONEXCHANGE_TYPES))
+_BAR1M_TYPES_SQL = ", ".join(f"'{t}'" for t in ("stock", *FUND_ONEXCHANGE_TYPES))
 
 LOG = logging.getLogger("rebuild")
 Q2END = {"q1": "-03-31", "q2": "-06-30", "q3": "-09-30", "q4": "-12-31"}
@@ -140,7 +145,8 @@ def rebuild_bars(client, start: str, resume: bool = True, limit_codes: int | Non
     client.command(MARKET_DDL["bar_1d"])  # IF NOT EXISTS
     end = dt.date.today().isoformat()
     codes = [r[0] for r in client.query(
-        f"SELECT instrument_id FROM {DATABASE}.securities WHERE type='stock' ORDER BY instrument_id").result_rows]
+        f"SELECT instrument_id FROM {DATABASE}.securities WHERE type IN ({_BAR_TYPES_SQL}) "
+        f"ORDER BY instrument_id").result_rows]
     if limit_codes:
         codes = codes[:limit_codes]
         LOG.info(f"  [测试模式] 仅前 {limit_codes} 只")
@@ -176,7 +182,9 @@ def rebuild_bars(client, start: str, resume: bool = True, limit_codes: int | Non
         raw["paused"] = raw["paused"].fillna(0).astype("uint8")
         raw["is_st"] = 0  # get_price 无 is_st,占位(不影响复权)
         raw["factor"] = raw["factor"].fillna(1.0)
-        client.insert_df(f"{DATABASE}.bar_1d", raw[out])
+        # 逐票灌整段历史:bar_1d 按月分区,一只票约 250 个月分区,超默认 100 上限 -> 抬到 500。
+        client.insert_df(f"{DATABASE}.bar_1d", raw[out],
+                         settings={"max_partitions_per_insert_block": 500})
         total_rows += len(raw)
         n_done += 1
         if n_done % 200 == 0:
@@ -201,7 +209,7 @@ def rebuild_bars_1m(client, start_year: int = 2005, resume: bool = True,
     requested_start = dt.date(start_year, 1, 1)
     securities = client.query(
         f"SELECT instrument_id, start_date, end_date FROM {DATABASE}.securities "
-        f"WHERE type='stock' ORDER BY instrument_id").result_rows
+        f"WHERE type IN ({_BAR1M_TYPES_SQL}) ORDER BY instrument_id").result_rows
     if limit_codes:
         securities = securities[:limit_codes]
         LOG.info(f"  [测试模式] 仅前 {limit_codes} 只")
