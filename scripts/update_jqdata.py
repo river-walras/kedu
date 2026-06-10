@@ -26,12 +26,15 @@ from jqdatasdk import (get_all_securities, get_query_count, get_trade_days,  # n
 
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
 from kedu.finance_schema import FUND_ONEXCHANGE_TYPES, FUND_SYNC_TABLES  # noqa: E402
+from kedu.calendar import _today_cn, get_trade_days as local_trade_days  # noqa: E402
 import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
 import scripts.backfill_index as bx  # noqa: E402
 import scripts.backfill_margin as bm  # noqa: E402
 import scripts.backfill_locked_shares as bls  # noqa: E402
+import scripts.backfill_money_flow as bmf  # noqa: E402
+import scripts.backfill_billboard as bbl  # noqa: E402
 
 # 支持日/分钟行情的 type(bar_1d/bar_1m 取价范围):股票 + 指数 + 场内基金。
 BAR_TYPES = ("stock", "index", *FUND_ONEXCHANGE_TYPES)
@@ -223,8 +226,19 @@ def update_bars_1m(client, today: str, min_spare: int = 2_000_000) -> None:
     print(f"  bar_1m: +{total:,} 行(逐票补到 {today})", flush=True)
 
 
+def _table_exists(client, table) -> bool:
+    return bool(client.query(f"EXISTS TABLE {DATABASE}.{table}").result_rows[0][0])
+
+
 def _max_day(client, table, col):
+    if not _table_exists(client, table):
+        return None
     return client.query(f"SELECT max({col}) FROM {DATABASE}.{table}").result_rows[0][0]
+
+
+def _recent_trade_start(end: str, count: int) -> str:
+    days = list(local_trade_days(end_date=end, count=max(1, count)))
+    return days[0].isoformat() if days else end
 
 
 def main() -> None:
@@ -240,11 +254,17 @@ def main() -> None:
     p.add_argument("--skip-index", action="store_true", help="跳过指数成分/权重/估值增量(index_member_history/index_weights/index_valuation)")
     p.add_argument("--skip-margin", action="store_true", help="跳过融资融券增量(mtss/margin_target_history)")
     p.add_argument("--skip-locked-shares", action="store_true", help="跳过限售解禁数据集刷新(locked_shares)")
+    p.add_argument("--skip-money-flow", action="store_true", help="跳过日频资金流向刷新(money_flow_pro)")
+    p.add_argument("--skip-billboard", action="store_true", help="跳过龙虎榜刷新(billboard)")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--bars-overlap-days", type=int, default=10,
                    help="bar_1d 增量回拉天数:自 max(day)-N 起重拉,覆盖盘中快照/当日定值修正"
                         "(ReplacingMergeTree 按 _ingested_at 顶旧值)")
+    p.add_argument("--money-flow-overlap-days", type=int, default=5,
+                   help="money_flow_pro 日更回拉最近 N 个交易日,覆盖盘后修正")
+    p.add_argument("--billboard-overlap-days", type=int, default=5,
+                   help="billboard 日更回拉最近 N 个交易日,覆盖 20:00/22:00 修正")
     p.add_argument("--min-spare", type=int, default=2_000_000,
                    help="bar_1m 逐票补齐时剩余配额低于此值优雅停止(重跑续传)")
     p.add_argument("--only-bars-1m", action="store_true",
@@ -254,7 +274,7 @@ def main() -> None:
     bk.jq_auth()
     auth_from_env()
     client = get_client()
-    today = dt.date.today().isoformat()
+    today = _today_cn().isoformat()
 
     if args.only_bars_1m:
         print("== bar_1m 逐票补齐(only)==")
@@ -330,18 +350,33 @@ def main() -> None:
         print("== 6.9) 限售解禁数据集刷新(locked_shares 全量重拉)==")
         bls.backfill(client, refresh=True, min_spare=args.min_spare)
 
+    if not args.skip_money_flow:
+        print("== 6.91) 日频资金流向刷新(money_flow_pro 最近交易日回拉)==")
+        mf_start = _recent_trade_start(today, args.money_flow_overlap_days)
+        bmf.backfill(client, start_date=mf_start, end_date=today, refresh=True,
+                     min_spare=args.min_spare)
+
+    if not args.skip_billboard:
+        print("== 6.92) 龙虎榜刷新(billboard 最近交易日按日替换)==")
+        bb_start = _recent_trade_start(today, args.billboard_overlap_days)
+        bbl.backfill(client, start_date=bb_start, end_date=today, refresh=True,
+                     min_spare=args.min_spare)
+
     optimize = ["trade_days", "income_statement", "income_statement_acc", "balance_sheet",
                 "cash_flow_statement", "cash_flow_statement_acc",
                 "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
                 "industries", "industry_history", "concepts", "concept_history",
                 "index_member_history", "index_weights", "index_valuation", "index_sync_state",
-                "mtss", "margin_target_history"]
+                "mtss", "margin_target_history", "money_flow_pro", "billboard"]
     if not args.skip_fund_finance:   # 仅当本轮同步了基金表(否则首跑时表未建,OPTIMIZE 会报错)
         optimize += ["fund_main_info", "fund_net_value", "fund_fin_indicator", "fund_portfolio",
                      "fund_portfolio_bond", "fund_portfolio_stock", "fund_invest_target",
                      "fund_dividend", "fund_share_daily", "fund_mf_daily_profit"]
     for t in optimize:
-        client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
+        if not _table_exists(client, t):
+            continue
+        final = "" if t == "billboard" else " FINAL"
+        client.command(f"OPTIMIZE TABLE {DATABASE}.{t}{final}")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。
     # 逐票自各自 max(datetime) 补到 today:缺失票补全历史、已满票只补新日,

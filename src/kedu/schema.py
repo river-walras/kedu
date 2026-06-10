@@ -147,6 +147,50 @@ ORDER BY (instrument_id, date)""",
   _ingested_at DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_ingested_at)
 ORDER BY (code, day)""",
+    # get_money_flow_pro 日频资金流向。data_type ∈ {'money','volume','deal'},长表存储,
+    # 避免三种统计口径互相覆盖。分钟资金流向为聚宽付费模块,本地接口 fail-fast。
+    "money_flow_pro": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.money_flow_pro (
+  time DateTime,
+  code String,
+  data_type String,
+  inflow_xl Nullable(Float64),
+  inflow_l Nullable(Float64),
+  inflow_m Nullable(Float64),
+  inflow_s Nullable(Float64),
+  outflow_xl Nullable(Float64),
+  outflow_l Nullable(Float64),
+  outflow_m Nullable(Float64),
+  outflow_s Nullable(Float64),
+  netflow_xl Nullable(Float64),
+  netflow_l Nullable(Float64),
+  netflow_m Nullable(Float64),
+  netflow_s Nullable(Float64),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+PARTITION BY toYYYYMM(time)
+ORDER BY (time, code, data_type)""",
+    # get_billboard_list 龙虎榜。普通 MergeTree 保留 live 可能出现的重复行与原始行序;
+    # 回补/日更按 day DELETE + INSERT 覆盖盘后 20:00/22:00 修正。
+    "billboard": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.billboard (
+  code String,
+  day Date,
+  direction Nullable(String),
+  rank Int64,
+  abnormal_code Int64,
+  abnormal_name Nullable(String),
+  sales_depart_name Nullable(String),
+  buy_value Nullable(Float64),
+  buy_rate Nullable(Float64),
+  sell_value Nullable(Float64),
+  sell_rate Nullable(Float64),
+  total_value Nullable(Float64),
+  net_value Nullable(Float64),
+  amount Nullable(Float64),
+  _position UInt32,
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, code)""",
 }
 
 

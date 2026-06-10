@@ -49,6 +49,8 @@ from .margin import (  # noqa: F401
     get_marginsec_stocks,
 )
 from .locked_shares import get_locked_shares  # noqa: F401
+from .money_flow import get_money_flow_pro  # noqa: F401
+from .billboard import get_billboard_list  # noqa: F401
 
 get_table_info = finance.get_table_info
 
@@ -82,6 +84,8 @@ __all__ = [
     "get_margincash_stocks",
     "get_marginsec_stocks",
     "get_locked_shares",
+    "get_money_flow_pro",
+    "get_billboard_list",
     "finance",
     "get_client",
     "auth",
