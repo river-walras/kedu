@@ -51,6 +51,10 @@ from .margin import (  # noqa: F401
 from .locked_shares import get_locked_shares  # noqa: F401
 from .money_flow import get_money_flow_pro  # noqa: F401
 from .billboard import get_billboard_list  # noqa: F401
+from .split_dividend import (  # noqa: F401
+    get_split_dividend,
+    get_capital_reform_dates,
+)
 
 get_table_info = finance.get_table_info
 
@@ -86,6 +90,8 @@ __all__ = [
     "get_locked_shares",
     "get_money_flow_pro",
     "get_billboard_list",
+    "get_split_dividend",
+    "get_capital_reform_dates",
     "finance",
     "get_client",
     "auth",

@@ -6,7 +6,7 @@
   - 有数据   → 按 pub_date 近窗口增量(含 report_type=1 重述,ReplacingMergeTree 去重)。
 
 覆盖财报三表 + 业绩预告/审计/预约披露/状态变动 + 市场汇总(成交概况/融资融券) +
-上市公司基本信息族 + 基金族 10 张表(逻辑表名见 finance_schema.RUN_QUERY_TABLES)。
+上市公司基本信息族(含除权除息) + 基金族 10 张表(逻辑表名见 finance_schema.RUN_QUERY_TABLES)。
 `--full` 强制全量(按年跳过已有、可续传);`--drop-finance` DROP 3 张 finance_* 表。
 每次调用聚宽 API 后打印剩余额度。
 """
@@ -46,9 +46,9 @@ CHUNK_COL_OVERRIDE: dict[str, str | None] = {
     "FUND_INVEST_TARGET": "pub_date",
 }
 
-# 小型可变主数据:pub_date 是实体属性(发行日),按水位增量会漏新上市基金(pub_date 偏早)。
+# 小型可变主数据:无可靠水位列,或水位列是实体属性(发行日),按水位增量会漏新行/修订。
 # 体量小 -> 每次增量也整表全量重拉(ReplacingMergeTree 按 id 去重,幂等)。
-FULL_RELOAD_TABLES = {"FUND_MAIN_INFO"}
+FULL_RELOAD_TABLES = {"FUND_MAIN_INFO", "STK_XR_XD"}
 
 # 同步的规范逻辑表(按 CH 表名去重,剔除别名)
 STK_SYNC_TABLES: list[str] = []

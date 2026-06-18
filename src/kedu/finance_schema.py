@@ -26,7 +26,7 @@ STK_TABLES: dict[str, str] = {
     "STK_EXCHANGE_TRADE_INFO": "stk_exchange_trade_info",
     "STK_MT_TOTAL": "stk_mt_total",
     # 上市公司基本信息族(reference/上市公司基本信息):基本信息/上市信息/简称变更/员工/
-    # 股东户数/预计解禁/实际解禁/大股东增减持/股本变动/股份冻结/前十大及十大流通股东
+    # 股东户数/预计解禁/实际解禁/大股东增减持/股本变动/除权除息/股份冻结/前十大及十大流通股东
     "STK_COMPANY_INFO": "stk_company_info",
     "STK_LIST": "stk_list",
     "STK_NAME_HISTORY": "stk_name_history",
@@ -36,6 +36,7 @@ STK_TABLES: dict[str, str] = {
     "STK_LIMITED_SHARES_UNLIMIT": "stk_limited_shares_unlimit",
     "STK_SHAREHOLDERS_SHARE_CHANGE": "stk_shareholders_share_change",
     "STK_CAPITAL_CHANGE": "stk_capital_change",
+    "STK_XR_XD": "stk_xr_xd",
     "STK_SHARES_FROZEN": "stk_shares_frozen",
     "STK_SHAREHOLDER_TOP10": "stk_shareholder_top10",
     "STK_SHAREHOLDER_FLOATING_TOP10": "stk_shareholder_floating_top10",
