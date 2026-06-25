@@ -30,8 +30,8 @@ from jqdatasdk import auth, get_query_count, query, income, balance  # noqa: E40
 
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
 from kedu.finance_schema import FUND_ONEXCHANGE_TYPES  # noqa: E402
-from kedu.schema import (MARKET_DDL, data_columns,  # noqa: E402
-                            day_view_ddl, statdate_table_ddl)
+from kedu.schema import MARKET_DDL, data_columns, statdate_table_ddl  # noqa: E402
+from kedu import day_materialize as daymat  # noqa: E402
 
 # 与日更口径一致:bar_1d 含股票/指数/场内基金;bar_1m 仅股票/场内基金(指数不入分钟线)。
 _BAR_TYPES_SQL = ", ".join(f"'{t}'" for t in ("stock", "index", *FUND_ONEXCHANGE_TYPES))
@@ -130,10 +130,12 @@ def rebuild_fundamentals(client, start_year: int) -> None:
     pull_snapshot(client, balance, "balance_sheet", quarters)
     for t in ("income_statement", "income_statement_acc", "balance_sheet"):
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t} FINAL")
-    # 重建 date 模式视图
+    # 物化本函数覆盖的 date 模式表(仅 income/balance;cash_flow/indicator 不在本函数范围)。
+    # 全量 4 张请用: `python -m kedu.day_materialize full-build --all`。
+    # 需 stock_valuation 已就绪(本函数不建估值表);为空时 full_build 会 raise。
     for v in ("income_statement_day", "balance_sheet_day"):
-        client.command(day_view_ddl(v))
-        LOG.info(f"  建视图 {v}")
+        n = daymat.full_build(client, v, verbose=False)
+        LOG.info(f"  物化表 {v}: {n:,} 行")
     for t in ("income_statement", "income_statement_acc", "balance_sheet"):
         n = client.query(f"SELECT count() FROM {DATABASE}.{t}").result_rows[0][0]
         LOG.info(f"  {t}: {n:,} 行")
@@ -240,7 +242,11 @@ def rebuild_bars_1m(client, start_year: int = 2005, resume: bool = True,
             year_end = min(code_end, dt.date(y, 12, 31))
             if year_start > year_end:
                 continue
-            s, e = year_start.isoformat(), year_end.isoformat()
+            # 端点须含当日盘中:裸日期 "YYYY-12-31" 被聚宽按 00:00:00 解释,首根分钟在 09:31,
+            # 否则会丢掉**交易日 12-31**整段 09:31-15:00 分钟线。23:59:00 收口对日线因子拉取(下方
+            # frequency='daily')亦无副作用(仍含当日日线)。
+            s = year_start.isoformat()
+            e = f"{year_end.isoformat()} 23:59:00"
             raw = jqdatasdk.get_price(code, start_date=s, end_date=e, frequency="1m",
                                       fields=pf, fq=None, panel=False, skip_paused=False)
             if raw is None or raw.empty:

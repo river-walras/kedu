@@ -34,9 +34,43 @@ _LOGICAL_TO_LOCAL = {
 _DATE_COLS = {"day", "statDate", "pubDate"}
 
 
+# 形如 IN ('a', 'b', ...) 的字符串字面量列表(支持 SQL 转义的 '')。
+_IN_LIST_RE = re.compile(
+    r"\bIN\s*\(\s*('(?:[^']|'')*'(?:\s*,\s*'(?:[^']|'')*')*)\s*\)",
+    re.IGNORECASE,
+)
+# 大列表阈值(字面量数):仅对 get_fundamentals 这种全宇宙 code IN (...) 走快路。
+_IN_LIST_MASK_MIN = 50
+_IN_LIST_SENTINEL = "'__KEDU_IN_LIST_MASK__'"
+
+
 def _to_clickhouse_sql(mysql_sql: str) -> str:
-    """将 MySQL 方言 SQL 转译为 ClickHouse 方言 SQL."""
-    return sqlglot.transpile(mysql_sql, read="mysql", write="clickhouse")[0]
+    """将 MySQL 方言 SQL 转译为 ClickHouse 方言 SQL.
+
+    全宇宙 ``get_fundamentals`` 每个交易日都重转译一条仅 ``code IN (...)`` 列表
+    内容不同、其余结构完全相同的 SQL,而该 IN 列表含约 4000+ 字符串字面量,
+    sqlglot 对其逐 token 解析/重排占转译耗时的绝大部分。MySQL 与 ClickHouse 对
+    ``IN ('a', 'b', ...)`` 的渲染完全一致,故将超长 IN 列表先替换为单一哨兵字面量
+    再转译(token 数骤降),随后把原列表原样拼回——经多个真实交易日全 SQL 逐字节
+    校验与完整转译结果一致(见 tests _probe_splice),非近似。任一不满足精确单
+    匹配的情形都回退到完整转译,保证忠实。
+    """
+    matches = [
+        m
+        for m in _IN_LIST_RE.finditer(mysql_sql)
+        # 字面量数 ≈ 顶层逗号数 + 1;用单引号计数粗筛(每个字面量至少一对引号)。
+        if m.group(1).count("'") >= 2 * _IN_LIST_MASK_MIN
+    ]
+    if len(matches) != 1:
+        return sqlglot.transpile(mysql_sql, read="mysql", write="clickhouse")[0]
+    m = matches[0]
+    in_list = m.group(1)
+    masked = mysql_sql[: m.start(1)] + _IN_LIST_SENTINEL + mysql_sql[m.end(1) :]
+    ch = sqlglot.transpile(masked, read="mysql", write="clickhouse")[0]
+    if ch.count(_IN_LIST_SENTINEL) != 1:
+        # 哨兵在转译后未原样保留(意外的方言改写)——回退,绝不产出可疑 SQL。
+        return sqlglot.transpile(mysql_sql, read="mysql", write="clickhouse")[0]
+    return ch.replace(_IN_LIST_SENTINEL, in_list)
 
 
 def _strip_default_limit(sql: str, query_object) -> str:
@@ -79,7 +113,15 @@ def _postprocess_fundamentals(df: pd.DataFrame) -> pd.DataFrame:
         elif base == "id":
             pass
         else:
-            df[name] = pd.to_numeric(df[name], errors="coerce").astype("float64")
+            # 财务列在 ClickHouse 为 (Nullable)Float64,经 query_arrow→to_pandas 已是
+            # 数值 dtype;此时 astype("float64") 与原 to_numeric(coerce) 结果一致但快得多
+            # (省去逐元素的字符串解析探测)。仅当意外拿到 object 列才回退 to_numeric。
+            col = df[name]
+            if col.dtype.kind in "fiu":
+                if col.dtype != "float64":
+                    df[name] = col.astype("float64")
+            else:
+                df[name] = pd.to_numeric(col, errors="coerce").astype("float64")
     return df
 
 
@@ -93,18 +135,42 @@ def get_fundamentals(query_object: SqlQuery, date: str | dt.date | int | None = 
     date 与 statDate 二选一. 本地执行时不截断, 会去掉聚宽默认 10000 行上限.
     """
     cli = get_client()
-    mysql_sql = _strip_default_limit(
-        get_fundamentals_sql(query_object, date=date, statDate=statDate,
-                             prev_trade_date=lambda d: _prev_trade_date(d, cli)),
-        query_object)
+    # get_fundamentals_sql() mutates query_object.limit_value to None as a side
+    # effect (it calls .limit(None) on the passed object, and SqlQuery.limit
+    # writes self.limit_value in place). Capture the user's explicit .limit(N)
+    # and .order_by() intent BEFORE generating the SQL, or _strip_default_limit
+    # would later see limit_value=None and strip an explicit LIMIT.
+    user_limit = getattr(query_object, "limit_value", None)
+    mysql_sql = get_fundamentals_sql(query_object, date=date, statDate=statDate,
+                                     prev_trade_date=lambda d: _prev_trade_date(d, cli))
+    # jqdatasdk honors an explicit .order_by(); detect it from the compiled SQL
+    # (the generator only emits ORDER BY when the query carries one).
+    has_order_by = bool(re.search(r"\bORDER\s+BY\b", mysql_sql, re.IGNORECASE))
+    # Drop only jqdatasdk's built-in default 10000-row LIMIT; preserve an
+    # explicit user .limit(N) (jqdatasdk returns exactly N rows in ORDER BY order).
+    if not user_limit:
+        mysql_sql = re.sub(r"\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$", "", mysql_sql,
+                           flags=re.IGNORECASE)
     df = query_df(cli, _to_clickhouse_sql(mysql_sql))
     df = _postprocess_fundamentals(df)
-    # date 模式下,「_day」视图会按交易日宇宙为尚无任何报告的次新股产出全 NaN 行;
-    # 聚宽不返回这类股票,故丢弃所有数据列均为 NaN 的行(与聚宽成员资格一致)。
+    # date 模式下「_day」关系现为 INNER JOIN(见 schema._day_select_body):尚无任何可见报告
+    # (pubDate<=day)的次新股已被内连接天然剔除,不再产出"估值非空、报告全空"的行。此处丢弃
+    # 数据列全 NaN 行已退化为防御性保护(仅当最新可见报告的每个数据列都恰为 NULL 时才触发,罕见);
+    # 物化表与 *_day_view 视图口径一致,该过滤对两者同样作用,不影响逐字节一致。
     if date is not None and not df.empty:
         data_cols = [c for c in df.columns if c not in _META_COLS]
         if data_cols:
             df = df[~df[data_cols].isna().all(axis=1)].reset_index(drop=True)
+    # ClickHouse does not guarantee row order without ORDER BY, which makes the
+    # result non-deterministic across runs. jqdatasdk.get_fundamentals returns
+    # rows sorted by ``code`` (ascending); reproduce that so downstream
+    # strategy ranking (non-stable ``sort_values`` over tied scores) is both
+    # deterministic and faithful to JoinQuant. When the query carries its own
+    # .order_by(), honor that order instead (jqdatasdk does) — the SQL ORDER BY
+    # already produced it and a code re-sort would corrupt it (e.g. an
+    # order_by(market_cap).limit(N) smallest-cap pick).
+    if not has_order_by and "code" in df.columns and not df.empty:
+        df = df.sort_values("code", kind="stable").reset_index(drop=True)
     return df
 
 

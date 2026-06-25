@@ -27,6 +27,7 @@ from jqdatasdk import (get_all_securities, get_query_count, get_trade_days,  # n
 from kedu.db import DATABASE, auth_from_env, get_client  # noqa: E402
 from kedu.finance_schema import FUND_ONEXCHANGE_TYPES, FUND_SYNC_TABLES  # noqa: E402
 from kedu.calendar import _today_cn, get_trade_days as local_trade_days  # noqa: E402
+from kedu import day_materialize as daymat  # noqa: E402
 import scripts.backfill_jq as bk  # noqa: E402
 import scripts.backfill_stk as stk  # noqa: E402
 import scripts.backfill_industry as bi  # noqa: E402
@@ -194,7 +195,10 @@ def update_bars_1m(client, today: str, min_spare: int = 2_000_000) -> None:
         code_rows = 0
         for y in range(fill_start.year, code_end.year + 1):
             ys = max(fill_start, dt.date(y, 1, 1)).isoformat()
-            ye = min(code_end, dt.date(y, 12, 31)).isoformat()
+            # 端点必须含**当日盘中**:裸日期 "YYYY-12-31" 被聚宽按 00:00:00 解释,而首根分钟在 09:31,
+            # 故会把当日整段 09:31-15:00 排除 -> 任何**交易日的 12-31**永远拉不到(游标随后越过该日,
+            # 该日被永久遗漏)。改为当日 23:59:00 收口,使最后一日的分钟线被完整纳入。
+            ye = f"{min(code_end, dt.date(y, 12, 31)).isoformat()} 23:59:00"
             raw = jqdatasdk.get_price(code, start_date=ys, end_date=ye, frequency="1m", fields=pf,
                                       fq=None, panel=False, skip_paused=False)
             if raw is None or raw.empty:
@@ -256,6 +260,11 @@ def main() -> None:
     p.add_argument("--skip-locked-shares", action="store_true", help="跳过限售解禁数据集刷新(locked_shares)")
     p.add_argument("--skip-money-flow", action="store_true", help="跳过日频资金流向刷新(money_flow_pro)")
     p.add_argument("--skip-billboard", action="store_true", help="跳过龙虎榜刷新(billboard)")
+    p.add_argument("--skip-day-tables", action="store_true",
+                   help="跳过 *_day 物化表增量刷新(income/cash_flow/indicator/balance _day)")
+    p.add_argument("--day-lookback-days", type=int, default=760,
+                   help="*_day 物化刷新回溯天数;须 >= 报告重拉窗口(quarters-back 对应),"
+                        "以覆盖迟到披露/重述对历史 (code,day) as-of 取值的传播")
     p.add_argument("--quarters-back", type=int, default=8)
     p.add_argument("--stk-overlap-days", type=int, default=180)
     p.add_argument("--bars-overlap-days", type=int, default=10,
@@ -377,6 +386,20 @@ def main() -> None:
             continue
         final = "" if t == "billboard" else " FINAL"
         client.command(f"OPTIMIZE TABLE {DATABASE}.{t}{final}")
+
+    # 6.95) *_day 物化表刷新。必须在上面 OPTIMIZE FINAL(基表已折叠为单版本)之后、bar_1m 之前:
+    # bar_1m 可能因配额优雅停止,放其前确保 *_day 当天必刷新。失败隔离:出错只告警不中止 main,
+    # base 更新此时已提交、bar_1m 仍照常跑,次日按回溯窗口自愈。迁移期(尚未物化)自动空跑。
+    if not args.skip_day_tables:
+        print("== 6.95) _day 物化表刷新(staging + REPLACE PARTITION 原子替换)==")
+        needed = max(args.quarters_back * 92, 731)
+        if args.day_lookback_days < needed:
+            print(f"  !! 警告:--day-lookback-days {args.day_lookback_days} < 报告重拉窗口约 {needed} 天,"
+                  f"超窗口的旧期重述不会传播到 *_day 表;请调大 --day-lookback-days 或定期全量重建。")
+        try:
+            daymat.refresh_incremental(client, lookback_days=args.day_lookback_days)
+        except Exception as e:  # noqa: BLE001  失败隔离:不中止日更,次日按回溯窗口自愈
+            print(f"  !! _day 物化刷新失败(已跳过,不影响 base 更新与 bar_1m):{type(e).__name__}: {e}")
 
     # bar_1m 最重、最耗配额:放在最后,确保其余必要更新先全部完成。
     # 逐票自各自 max(datetime) 补到 today:缺失票补全历史、已满票只补新日,

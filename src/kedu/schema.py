@@ -73,31 +73,89 @@ def stock_valuation_ddl() -> str:
 ORDER BY (code, day)"""
 
 
-def day_view_ddl(name: str) -> str:
-    """生成 date 模式基本面视图 DDL.
+def _day_select_body(name: str, where: str | None = None) -> str:
+    """生成 date 模式基本面 as-of 的 SELECT 主体(视图与物化表共用,口径同源)。
 
     对每个 code 与 day, 取 pubDate<=day 的报告中 statDate 最大者作为最近报告期.
     不能用 ASOF JOIN, 它只按 pubDate 取最近一条. 年报与一季报常同日披露,
     ASOF 在并列时任取一条会错选去年年报, 聚宽返回 statDate 更大的当期报告.
 
-    两段式以保证谓词下推与执行效率. picked 只带 key, day 与 code,
-    GROUP BY code 与 day 后取 max(statDate), 再按 code 与 statDate 等值 JOIN 回基表.
+    单段 GROUP-BY argMax 实现: stock_valuation 与基表按 code 等值 + ``pubDate<=day``
+    内连接后, 按 (code, day) 分组, 用 ``argMax(col, statDate)`` 直接取 statDate 最大
+    那一条报告的各列值。较早先「picked 取 max(statDate) 再等值 JOIN 回基表」两段式
+    少一次 JOIN, q1(全市场 28 列 5 表)由 ~585ms 降到 ~420ms, 结果逐字节一致。
+
+    NULL 保真: ClickHouse ``argMax(arg, val)`` 会跳过 ``arg`` 为 NULL 的行, 若最新报告
+    某列为 NULL 会误取上一期非空值。故用 ``argMax(tuple(col), statDate).1`` —— tuple 整体
+    永不为 NULL, argMax 选中 statDate 最大那行后再 ``.1`` 取回(可能为 NULL 的)原值,
+    与两段式 JOIN 回基表的 NULL 行为完全一致(已对多日含季报披露日逐字段校验)。
+
+    INNER JOIN(非 LEFT): 聚宽 get_fundamentals 对所引用的报告期表做内连接,
+    某交易日尚无任一可见报告(pubDate<=day)的标的不返回。早先用 LEFT JOIN + 估值表脊柱,
+    会为这类标的产出"估值列非空、报告列全空"的行,聚宽不返回(实测 get_fundamentals 较
+    jqdatasdk 多出该类标的),从而抬高样本数、改变下游打分排名。INNER 连接将其自然剔除,
+    成员资格与 jqdatasdk 逐一致。
+
+    ``where`` 用于物化时按 day 区间分片(放在 GROUP BY 之前的 WHERE, 作用于 ``sv.day``)。
+    因 GROUP BY 是 per (code, day)、join 条件 ``b.pubDate<=sv.day``, 按 day 切片不改变
+    任一 (code, day) 单元的取值, 故分区物化与整表现算逐字节一致。
     """
     base, model = DAY_VIEWS[name]
-    proj = ",\n  ".join(f"b.`{c}` AS `{c}`" for c in data_columns(model))
-    return f"""CREATE OR REPLACE VIEW {DATABASE}.{name} AS
-WITH picked AS (
-  SELECT sv.code AS code, sv.day AS day, max(b.statDate) AS statDate
-  FROM {DATABASE}.stock_valuation AS sv
-  LEFT JOIN {DATABASE}.{base} AS b
-    ON sv.code = b.code AND b.pubDate <= sv.day
-  GROUP BY sv.code, sv.day
-)
-SELECT b.id AS id, p.code AS code, p.day AS day, b.pubDate AS pubDate, p.statDate AS statDate,
-  {proj}
-FROM picked AS p
-LEFT JOIN {DATABASE}.{base} AS b
-  ON p.code = b.code AND p.statDate = b.statDate"""
+    picks = [
+        "argMax(tuple(b.id), b.statDate).1 AS id",
+        "argMax(tuple(b.pubDate), b.statDate).1 AS pubDate",
+        "max(b.statDate) AS statDate",
+    ]
+    # 数据列统一转 Float64。income/cash_flow/balance 报表列为 Decimal(20,4),
+    # query_arrow→pandas 会物化成 Python Decimal object 列(arrow 物化慢, 且
+    # postprocess 需逐元素 to_numeric 解析)。在视图里 toFloat64 直接产出 Float64,
+    # arrow→pandas 走快路径, postprocess 也省去 to_numeric。toFloat64(Decimal) 与
+    # Python float(Decimal) 经全表 250 万非空值校验逐位一致, 故逐字节不变;
+    # financial_indicator 本就是 Float64, toFloat64 为 no-op。NULL 保真: 对 Nullable
+    # 入参 toFloat64 传播 NULL, 仍配合 tuple-argMax 在并列报告期取回原值(含 NULL)。
+    picks += [
+        f"toFloat64(argMax(tuple(b.`{c}`), b.statDate).1) AS `{c}`"
+        for c in data_columns(model)
+    ]
+    cols = ",\n  ".join(picks)
+    where_clause = f"\nWHERE {where}" if where else ""
+    return f"""SELECT sv.code AS code, sv.day AS day,
+  {cols}
+FROM {DATABASE}.stock_valuation AS sv
+INNER JOIN {DATABASE}.{base} AS b
+  ON sv.code = b.code AND b.pubDate <= sv.day{where_clause}
+GROUP BY sv.code, sv.day"""
+
+
+def day_view_ddl(name: str) -> str:
+    """生成 date 模式基本面 as-of 视图 DDL。
+
+    视图名为 ``{name}_view``(如 income_statement_day_view), 仅供 A/B 校验与回退;
+    查询热点路径使用的同名 drop-in 关系由 day_materialize.full_build 物化成表。
+    """
+    return f"CREATE OR REPLACE VIEW {DATABASE}.{name}_view AS\n{_day_select_body(name)}"
+
+
+def day_table_ddl(name: str) -> str:
+    """生成 date 模式基本面 as-of 物化表 DDL(与 *_day 视图同名, 透明 drop-in)。
+
+    列与 _day_select_body 产出严格对齐: 数据列统一 Nullable(Float64)(视图 toFloat64 口径)。
+    按月分区 + ORDER BY (day, code): q1 谓词 ``day = X AND code IN (...)`` 走分区裁剪 + 主键定位;
+    分区粒度也是日更 REPLACE PARTITION 的原子单元。
+    """
+    _, model = DAY_VIEWS[name]
+    cols = ",\n  ".join(f"`{c}` {_FLOAT}" for c in data_columns(model))
+    return f"""CREATE TABLE IF NOT EXISTS {DATABASE}.{name} (
+  code String,
+  day Date,
+  id Int64,
+  pubDate Date,
+  statDate Date,
+  {cols},
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+PARTITION BY toYYYYMM(day)
+ORDER BY (day, code)"""
 
 
 # ---- 行情 / 主表 DDL(聚宽 get_price / get_all_securities / get_trade_days)----
@@ -316,7 +374,12 @@ def all_table_ddls() -> dict[str, str]:
 
 
 def create_all(client, include_views: bool = True, verbose: bool = True) -> None:
-    """创建全部 ClickHouse 表与可选视图."""
+    """创建全部 ClickHouse base 表与可选 *_day_view 校验视图。
+
+    注意: **不创建** date 模式查询用的同名 *_day drop-in 关系 —— 它们由
+    day_materialize.full_build 显式物化成表。include_views=True 仅创建用于 A/B 校验
+    与回退的 *_day_view 视图。
+    """
     for name, ddl in all_table_ddls().items():
         if verbose:
             print(f"creating table {DATABASE}.{name}")
@@ -324,7 +387,7 @@ def create_all(client, include_views: bool = True, verbose: bool = True) -> None
     if include_views:
         for name in DAY_VIEWS:
             if verbose:
-                print(f"creating view {DATABASE}.{name}")
+                print(f"creating view {DATABASE}.{name}_view")
             client.command(day_view_ddl(name))
 
 

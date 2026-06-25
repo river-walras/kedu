@@ -16,6 +16,11 @@ DATABASE = "jqdata"
 # auth() 写入的连接凭证;为空表示尚未 auth,get_client() 将 raise。
 _CREDENTIALS: dict = {}
 
+# 默认库的客户端缓存。clickhouse_connect.get_client() 构造时会与服务端握手
+# (查 version/timezone 等, 数次往返); 回测里每次 get_fundamentals 都新建客户端会
+# 反复握手。默认库的客户端复用单例; 显式传 database 覆盖时仍每次新建(非热点路径)。
+_DEFAULT_CLIENT = None
+
 
 def auth(username, password, host: str = "localhost", port: int = 8123,
          database: str = DATABASE) -> None:
@@ -24,6 +29,7 @@ def auth(username, password, host: str = "localhost", port: int = 8123,
     后续 get_client() 使用该凭证. 与 jqdatasdk.auth 对称, 交互式用法为
     `from kedu import auth; auth("user", "pwd")`.
     """
+    global _DEFAULT_CLIENT
     _CREDENTIALS.update(
         host=host,
         port=int(port),
@@ -31,6 +37,7 @@ def auth(username, password, host: str = "localhost", port: int = 8123,
         password=password,
         database=database,
     )
+    _DEFAULT_CLIENT = None  # 凭证变更,丢弃旧缓存客户端
     print(f"clickhouse auth: {username}@{host}:{port}/{database}")
 
 
@@ -60,16 +67,23 @@ def get_client(database: str | None = None):
     """返回 clickhouse_connect 客户端.
 
     须先调用 auth(), 否则 raise. database 可覆盖认证时设定的库名.
+    默认库(database is None)复用缓存的单例客户端以省去重复握手;
+    显式覆盖 database 时每次新建(非回测热点路径)。
     """
     if not _CREDENTIALS:
         raise RuntimeError(
             "尚未认证 ClickHouse:请先调用 kedu.auth(username, password) "
             "(脚本可用 kedu.auth_from_env())"
         )
-    cfg = dict(_CREDENTIALS)
     if database is not None:
+        cfg = dict(_CREDENTIALS)
         cfg["database"] = database
-    return clickhouse_connect.get_client(**cfg)
+        return clickhouse_connect.get_client(**cfg)
+
+    global _DEFAULT_CLIENT
+    if _DEFAULT_CLIENT is None:
+        _DEFAULT_CLIENT = clickhouse_connect.get_client(**_CREDENTIALS)
+    return _DEFAULT_CLIENT
 
 
 def query_df(client, sql: str):
