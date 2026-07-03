@@ -7,6 +7,7 @@
 - 行情和主表用 `instrument_id`, 对齐 factors 表.
 - 基本面镜像表用 `code` / `day` / `statDate` / `pubDate`, 必须与 vendored 模型 SQL 列名一致.
 """
+
 from __future__ import annotations
 
 from ._jqsdk import balance, cash_flow, income, indicator, valuation
@@ -249,6 +250,29 @@ ORDER BY (time, code, data_type)""",
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(day)
 ORDER BY (day, code)""",
+    # get_call_auction 集合竞价 tick(每票每交易日一行 09:25 快照)。(code, time) 每日唯一,
+    # ReplacingMergeTree 保证重拉幂等;读侧加 FINAL。五档 price/volume 均 Nullable(Float64):
+    # 指数无盘口 -> 五档为 NULL;股票/基金有盘口。由 scripts/backfill_call_auction.py 逐票灌入。
+    "call_auction": f"""CREATE TABLE IF NOT EXISTS {DATABASE}.call_auction (
+  time DateTime,
+  code String,
+  current Nullable(Float64),
+  volume Nullable(Float64),
+  money Nullable(Float64),
+  a1_p Nullable(Float64), a1_v Nullable(Float64),
+  a2_p Nullable(Float64), a2_v Nullable(Float64),
+  a3_p Nullable(Float64), a3_v Nullable(Float64),
+  a4_p Nullable(Float64), a4_v Nullable(Float64),
+  a5_p Nullable(Float64), a5_v Nullable(Float64),
+  b1_p Nullable(Float64), b1_v Nullable(Float64),
+  b2_p Nullable(Float64), b2_v Nullable(Float64),
+  b3_p Nullable(Float64), b3_v Nullable(Float64),
+  b4_p Nullable(Float64), b4_v Nullable(Float64),
+  b5_p Nullable(Float64), b5_v Nullable(Float64),
+  _ingested_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_ingested_at)
+PARTITION BY toYYYYMM(time)
+ORDER BY (code, time)""",
 }
 
 
@@ -300,9 +324,22 @@ ORDER BY (concept_code, stock, start_date)""",
 # index_sync_state 记录每个 (dataset, index_code) 已扫描到的交易日 covered_until,
 #   解决「多年不调仓无法判断扫完」与「空月/空日反复重拉」。dataset ∈ {member, weight, valuation}。
 _INDEX_VAL_COLS = [
-    "pe_ratio", "turnover_ratio", "pb_ratio", "ps_ratio", "pcf_ratio", "capitalization",
-    "market_cap", "circulating_cap", "circulating_market_cap", "pe_ratio_lyr", "pcf_ratio2",
-    "dividend_ratio", "free_cap", "free_market_cap", "a_cap", "a_market_cap",
+    "pe_ratio",
+    "turnover_ratio",
+    "pb_ratio",
+    "ps_ratio",
+    "pcf_ratio",
+    "capitalization",
+    "market_cap",
+    "circulating_cap",
+    "circulating_market_cap",
+    "pe_ratio_lyr",
+    "pcf_ratio2",
+    "dividend_ratio",
+    "free_cap",
+    "free_market_cap",
+    "a_cap",
+    "a_market_cap",
 ]
 _INDEX_VAL_COLS_DDL = ",\n  ".join(f"`{c}` {_FLOAT}" for c in _INDEX_VAL_COLS)
 

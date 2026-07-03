@@ -4,6 +4,7 @@
 (见 kedu._jqsdk, 自 jqdatasdk copy 出, 运行时不再依赖 jqdatasdk), 纯本地且无网络,
 执行层走本地 ClickHouse. 报告期 STK_* 表用本地自建 SQLAlchemy 模型, 见 kedu.finance, 无需 auth.
 """
+
 from __future__ import annotations
 
 # vendored 的 SQLAlchemy 模型对象作为查询表面(运行时零 jqdatasdk 依赖)
@@ -51,6 +52,8 @@ from .margin import (  # noqa: F401
 from .locked_shares import get_locked_shares  # noqa: F401
 from .money_flow import get_money_flow_pro  # noqa: F401
 from .billboard import get_billboard_list  # noqa: F401
+from .valuation import get_valuation  # noqa: F401
+from .call_auction import get_call_auction  # noqa: F401
 from .split_dividend import (  # noqa: F401
     get_split_dividend,
     get_capital_reform_dates,
@@ -90,6 +93,8 @@ __all__ = [
     "get_locked_shares",
     "get_money_flow_pro",
     "get_billboard_list",
+    "get_valuation",
+    "get_call_auction",
     "get_split_dividend",
     "get_capital_reform_dates",
     "finance",

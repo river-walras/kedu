@@ -36,6 +36,7 @@ import scripts.backfill_margin as bm  # noqa: E402
 import scripts.backfill_locked_shares as bls  # noqa: E402
 import scripts.backfill_money_flow as bmf  # noqa: E402
 import scripts.backfill_billboard as bbl  # noqa: E402
+import scripts.backfill_call_auction as bca  # noqa: E402
 
 # 支持日/分钟行情的 type(bar_1d/bar_1m 取价范围):股票 + 指数 + 场内基金。
 BAR_TYPES = ("stock", "index", *FUND_ONEXCHANGE_TYPES)
@@ -260,6 +261,7 @@ def main() -> None:
     p.add_argument("--skip-locked-shares", action="store_true", help="跳过限售解禁数据集刷新(locked_shares)")
     p.add_argument("--skip-money-flow", action="store_true", help="跳过日频资金流向刷新(money_flow_pro)")
     p.add_argument("--skip-billboard", action="store_true", help="跳过龙虎榜刷新(billboard)")
+    p.add_argument("--skip-call-auction", action="store_true", help="跳过集合竞价刷新(call_auction)")
     p.add_argument("--skip-day-tables", action="store_true",
                    help="跳过 *_day 物化表增量刷新(income/cash_flow/indicator/balance _day)")
     p.add_argument("--day-lookback-days", type=int, default=760,
@@ -274,6 +276,11 @@ def main() -> None:
                    help="money_flow_pro 日更回拉最近 N 个交易日,覆盖盘后修正")
     p.add_argument("--billboard-overlap-days", type=int, default=5,
                    help="billboard 日更回拉最近 N 个交易日,覆盖 20:00/22:00 修正")
+    p.add_argument("--valuation-overlap-days", type=int, default=3,
+                   help="stock_valuation 日更自 max(day)-N 起重拉并 skip=False 覆盖,"
+                        "顶掉盘中 08:30 半成品(仅股本、其余置空)")
+    p.add_argument("--call-auction-overlap-days", type=int, default=3,
+                   help="call_auction 日更自各票 max(time)-N 起重拉,覆盖盘后 15:00→24:00 校对修正")
     p.add_argument("--min-spare", type=int, default=2_000_000,
                    help="bar_1m 逐票补齐时剩余配额低于此值优雅停止(重跑续传)")
     p.add_argument("--only-bars-1m", action="store_true",
@@ -311,9 +318,12 @@ def main() -> None:
 
     print("== 3) stock_valuation 增量 ==")
     last = _max_day(client, "stock_valuation", "day")
-    vstart = (last + dt.timedelta(days=1)).isoformat() if last else "2005-01-01"
+    # 不用 max(day)+1:估值表当日 08:30 先写股本、16:00 才写全指标,回拉最近 N 天并 skip=False
+    # 重写,让盘中半成品被盘后全量顶掉(stock_valuation 为 ReplacingMergeTree,覆盖幂等)。
+    vstart = ((last - dt.timedelta(days=args.valuation_overlap_days)).isoformat()
+              if last else "2005-01-01")
     vdates = [d.strftime("%Y-%m-%d") for d in get_trade_days(start_date=vstart, end_date=today)]
-    bk.backfill_valuation(client, vdates, skip=True)
+    bk.backfill_valuation(client, vdates, skip=False)
 
     if not args.skip_bars:
         print("== 4) bar_1d 增量 ==")
@@ -371,12 +381,19 @@ def main() -> None:
         bbl.backfill(client, start_date=bb_start, end_date=today, refresh=True,
                      min_spare=args.min_spare)
 
+    if not args.skip_call_auction:
+        # 集合竞价:逐票自 max(time) 游标续传(缺票补历史、已满票只补新日),overlap 覆盖盘后校对修正。
+        # 历史种子(全市场全历史)也走同一 backfill(),配额不足优雅停止、重跑续传。
+        print("== 6.93) 集合竞价增量(call_auction 逐票 max(time) 续传)==")
+        bca.backfill(client, end_date=today, overlap_days=args.call_auction_overlap_days,
+                     min_spare=args.min_spare)
+
     optimize = ["trade_days", "income_statement", "income_statement_acc", "balance_sheet",
                 "cash_flow_statement", "cash_flow_statement_acc",
                 "financial_indicator", "financial_indicator_acc", "stock_valuation", "bar_1d",
                 "industries", "industry_history", "concepts", "concept_history",
                 "index_member_history", "index_weights", "index_valuation", "index_sync_state",
-                "mtss", "margin_target_history", "money_flow_pro", "billboard"]
+                "mtss", "margin_target_history", "money_flow_pro", "billboard", "call_auction"]
     if not args.skip_fund_finance:   # 仅当本轮同步了基金表(否则首跑时表未建,OPTIMIZE 会报错)
         optimize += ["fund_main_info", "fund_net_value", "fund_fin_indicator", "fund_portfolio",
                      "fund_portfolio_bond", "fund_portfolio_stock", "fund_invest_target",
