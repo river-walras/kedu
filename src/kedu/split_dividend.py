@@ -92,26 +92,79 @@ def _stock_split_dividend(
     return records
 
 
+#: Tolerance for treating ``distributed_share_base_implement`` as "unchanged"
+#: from the board/shareholders-approved base (see :func:`_stock_bonus_pre_tax`)
+#: -- purely a floating-point-compare guard, not a materiality threshold: the
+#: two verified cases either match to the reported precision exactly (603798.
+#: XSHG, no revision) or differ by double-digit percent (000898.XSHE, a real
+#: revision), so any epsilon well under 1% separates them identically.
+_BASE_REVISION_EPSILON = 1.0
+
 def _stock_bonus_pre_tax(row: dict[str, Any], bonus_ratio_rmb: float) -> float:
     """每股税前现金分红, 复刻聚宽回测口径.
 
-    聚宽公告的 ``bonus_ratio_rmb`` 是 "每 10 股 X 元", 其基数是分配预案的股本
-    (``distributed_share_base``), 当公司存在已回购/受限股时, 它小于总股本
-    (``total_capital``)。而聚宽回测真正入账的【每股税前分红】= 派现总额 /
-    总股本 = ``bonus_amount_rmb / total_capital_before_transfer`` (四舍五入到 4 位),
-    再按 20% 计税(见 jqboson ``account/base.py`` 的 ``bonus_post_tax``)。
+    ``bonus_amount_rmb``(派现总额)在公司公告时恒等于 ``(bonus_ratio_rmb / 10) ×
+    该次分配【当时用的】股本基数`` —— 但这个基数在实施阶段可能被【下修】(比如新纳入
+    一个回购专户排除范围), 也可能【从未变过】。两种情形聚宽回测入账的口径不同, 不
+    存在能同时套用的单一基数字段:
 
-    二者通常一致(总股本==分配基数), 仅当有库存股时不同。实证:
-    603798.XSHG 2021-06-10 公告 10派1.2(=>0.12), 但回测每股税前
-    ``round(2367.2275 / 20000, 4) = 0.1184`` (税后 0.09472)。聚宽 ``dividend_store``
-    的内部 pickle 已是该实际每股值; kedu 此前误用公告比例 / 10, 导致分红现金偏高。
+    * 若 ``distributed_share_base_implement``(实施阶段核定基数)相对
+      ``distributed_share_base_shareholders``/``board``(股东大会/董事会阶段基数)
+      发生了下修(数值不同), 说明实施时有新的股本变动被计入本次分配的除外范围,
+      此时聚宽入账用的是【下修后的实施基数】。
+    * 若三个阶段基数完全一致(未下修), 聚宽入账实际用的是
+      ``total_capital_before_transfer``(分配前总股本快照), 不是公告基数——两者
+      的微小差异(通常 <2%)反映的是分配基准日之后、与本次分配无关的股本变动,
+      聚宽仍按全部总股本摊薄计入。
 
-    数据缺失(无派现总额或总股本)时回落到公告口径 ``bonus_ratio_rmb / 10``。
+    实证(两个真实持仓, 均逐笔核对到聚宽导出的真实数据, 结论互相矛盾, 说明没有
+    "无脑用某个基数"的简单规则; 上面的下修判定是唯一能同时复现两者的规则):
+
+    * 000898.XSHE 2021-06-23 除权, 10派0.84(公告值=>0.084)。
+      ``distributed_share_base_board`` == ``_shareholders`` == 939960.0178, 但
+      ``distributed_share_base_implement`` = 798806.0178 —— **下修了 15%**。
+      聚宽口径用下修后的实施基数: ``67099.7055 / 798806.0178 = 0.084``。对照
+      ``tests/strategies/board_continuation/`` 的真实持仓: 2021-06-22 买入、次日
+      除权, 导出的 ``开仓均价`` 由 4.76 精确降至 4.676(=4.76-0.084), 现金变动精确
+      等于 ``8400 × 0.084 × 0.8 = 564.48`` —— 与 0.084 逐位吻合, 与
+      ``total_capital_before_transfer=940525.0201`` 算出的 0.0713 不吻合。
+    * 603798.XSHG 2021-06-10 除权, 10派1.2(公告值=>0.12)。
+      ``distributed_share_base_board`` == ``_shareholders`` == ``_implement`` =
+      19726.8961 —— **三阶段完全一致, 未下修**。聚宽口径改用
+      ``total_capital_before_transfer=20000``: ``2367.2275 / 20000 = 0.1184``。
+      对照 ``tests/strategies/small_cap/`` 的真实持仓: 2021-06-09 买入 1100 股
+      (10.49), 2021-06-10 09:30 卖出(除权后, 持仓已跨过 08:00 分红入账), 成交价
+      10.50、导出的平仓盈亏精确等于 141.24 = ``(10.50 - (10.49 - 0.1184)) ×
+      1100``——与 0.1184 逐位吻合; 若用未下修的实施基数算出的 0.12, 平仓盈亏应为
+      ``(10.50 - (10.49 - 0.12)) × 1100 = 143`` (与真实的 141.24 不符)。
+
+    数据缺失(无派现总额)时回落到公告口径 ``bonus_ratio_rmb / 10``。再按 20% 计税
+    (见 jqboson ``account/base.py`` 的 ``bonus_post_tax``)。
     """
     bonus_amount = _float_or_zero(row.get("bonus_amount_rmb"))
-    total_capital = _float_or_zero(row.get("total_capital_before_transfer"))
-    if bonus_amount > 0.0 and total_capital > 0.0:
-        return round(bonus_amount / total_capital, 4)
+    if bonus_amount <= 0.0:
+        return bonus_ratio_rmb / 10.0
+
+    implement_base = _float_or_zero(row.get("distributed_share_base_implement"))
+    approved_base = _float_or_zero(
+        row.get("distributed_share_base_shareholders")
+    ) or _float_or_zero(row.get("distributed_share_base_board"))
+    if (
+        implement_base > 0.0
+        and approved_base > 0.0
+        and abs(implement_base - approved_base) > _BASE_REVISION_EPSILON
+    ):
+        return round(bonus_amount / implement_base, 4)
+
+    for base_field in (
+        "total_capital_before_transfer",
+        "distributed_share_base_implement",
+        "distributed_share_base_shareholders",
+        "distributed_share_base_board",
+    ):
+        base = _float_or_zero(row.get(base_field))
+        if base > 0.0:
+            return round(bonus_amount / base, 4)
     return bonus_ratio_rmb / 10.0
 
 

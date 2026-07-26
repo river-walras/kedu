@@ -88,6 +88,76 @@ def test_get_split_dividend_maps_stock_xr_xd(monkeypatch) -> None:
     ]
 
 
+def test_get_split_dividend_uses_implement_base_only_when_revised(
+    monkeypatch,
+) -> None:
+    """No single base field is universally correct -- which one JoinQuant
+    actually books depends on whether the distribution base was revised
+    between shareholder approval and implementation:
+
+    * 000898.XSHE 2021-06-23: ``distributed_share_base_implement``
+      (798806.0178) was revised DOWN from the board/shareholders-approved
+      939960.0178 -- JoinQuant books the revised implementation base:
+      ``67099.7055 / 798806.0178 = 0.084`` (verified against the real
+      position in ``tests/strategies/board_continuation/``: 开仓均价 4.76 ->
+      4.676 exactly, cash += 8400*0.084*0.8 = 564.48 exactly).
+    * 603798.XSHG 2021-06-10: all three distribution-base fields are
+      identical (19726.8961, unrevised) -- JoinQuant instead books
+      ``total_capital_before_transfer``: ``2367.2275 / 20000 = 0.1184``
+      (verified against the real position in
+      ``tests/strategies/small_cap/``: realized P&L on the 06-10 sell is
+      141.24 = ``(10.50 - (10.49 - 0.1184)) * 1100`` exactly; the unrevised
+      implement base would give 0.12, which reproduces neither)."""
+    _patch(
+        monkeypatch,
+        [
+            pd.DataFrame(
+                [
+                    {
+                        "code": "000898.XSHE",
+                        "a_xr_date": dt.date(2021, 6, 23),
+                        "dividend_ratio": None,
+                        "transfer_ratio": None,
+                        "bonus_ratio_rmb": 0.84,
+                        "bonus_amount_rmb": 67099.7055,
+                        "total_capital_before_transfer": 940525.0201,
+                        "distributed_share_base_board": 939960.0178,
+                        "distributed_share_base_shareholders": 939960.0178,
+                        "distributed_share_base_implement": 798806.0178,
+                    },
+                    {
+                        "code": "603798.XSHG",
+                        "a_xr_date": dt.date(2021, 6, 10),
+                        "dividend_ratio": None,
+                        "transfer_ratio": None,
+                        "bonus_ratio_rmb": 1.2,
+                        "bonus_amount_rmb": 2367.2275,
+                        "total_capital_before_transfer": 20000.0,
+                        "distributed_share_base_board": 19726.8961,
+                        "distributed_share_base_shareholders": 19726.8961,
+                        "distributed_share_base_implement": 19726.8961,
+                    },
+                ]
+            )
+        ],
+    )
+
+    records = sd.get_split_dividend("000898.XSHE", "2021-01-01", "2021-12-31")
+
+    assert records == [
+        {
+            "date": dt.date(2021, 6, 10),
+            "bonus_pre_tax": 0.1184,
+            "scale_factor": 1.0,
+        },
+        {
+            "date": dt.date(2021, 6, 23),
+            "bonus_pre_tax": 0.084,
+            "scale_factor": 1.0,
+        },
+    ]
+
+
 def test_get_split_dividend_maps_fund_with_otc_sentinel(monkeypatch) -> None:
     _patch(
         monkeypatch,
