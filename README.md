@@ -207,6 +207,134 @@ UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_fundamentals.py -xvs
 UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_index.py -xvs
 ```
 
+## MCP server
+
+把 kedu 暴露给 Claude Code / Codex 等 MCP 客户端。分层混合设计：12 个高频 API 直出 tool，
+长尾 API 走 `kedu_call` 反射 dispatcher，`kedu_describe` 做发现。
+
+**不提供裸 SQL 通道**：每条出口最终都落在 `kedu.*` 上。直接打 ClickHouse 会绕开复权动态锚、
+成员资格语义、`report_type` 多版本去重、行业区间折叠等处理，拿到的数字看着正常但是错的。
+
+MCP server 走可选 extra，装 `kedu[mcp]` 即可；`kedu-mcp` 是包暴露的入口点。
+凭证从环境变量读取（`auth_from_env`），写在 MCP 配置的 `env` 块里即可，不需要 `--env-file`。
+
+需要 `kedu>=0.1.3`。
+
+### 注册到客户端
+
+Claude Code（`~/.claude.json`）：
+
+```json
+{
+  "mcpServers": {
+    "kedu": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "kedu[mcp]", "kedu-mcp"],
+      "env": {
+        "CLICKHOUSE_HOST": "127.0.0.1",
+        "CLICKHOUSE_PORT": "8123",
+        "CLICKHOUSE_USER": "admin",
+        "CLICKHOUSE_PASSWORD": "<password>",
+        "CLICKHOUSE_DATABASE": "jqdata"
+      }
+    }
+  }
+}
+```
+
+Codex（`~/.codex/config.toml`）：
+
+```toml
+[mcp_servers.kedu]
+command = "uvx"
+args = ["--from", "kedu[mcp]", "kedu-mcp"]
+startup_timeout_sec = 20.0
+tool_timeout_sec = 60.0
+
+[mcp_servers.kedu.env]
+CLICKHOUSE_HOST = "127.0.0.1"
+CLICKHOUSE_PORT = "8123"
+CLICKHOUSE_USER = "admin"
+CLICKHOUSE_PASSWORD = "<password>"
+CLICKHOUSE_DATABASE = "jqdata"
+```
+
+装进某个项目而不是临时拉起，用 `uv add 'kedu[mcp]'`，客户端 `command` 改成 `kedu-mcp`。
+
+### 从源码跑（开发用）
+
+在仓库根目录：
+
+```bash
+uv sync --extra mcp
+uv run --env-file .env kedu-mcp                      # stdio
+uv run --env-file .env kedu-mcp --transport http     # streamable-http
+```
+
+要让客户端指向工作副本而不是 PyPI 版本，把上面配置的 `command` 换成 `uv`、
+`args` 换成 `["run", "--directory", "<仓库路径>", "--extra", "mcp", "kedu-mcp"]`，
+`env` 块不变。或者 `uv tool install --editable '.[mcp]'` 装一个跟随源码的全局
+`kedu-mcp`（卸载 `uv tool uninstall kedu`）。
+
+**别用 `uvx --from '<本地路径>[mcp]'`。** uv 会把本地路径构建出的 wheel 连同整个 tool
+环境按需求串缓存住，改了源码不重建，`--refresh` / `--reinstall` / `--refresh-package`
+三个都救不回来。这个缓存语义对 PyPI 上的不可变版本是对的，对本地路径是陷阱。
+
+### HTTP 常驻
+
+多个客户端共享一个进程时用 streamable-http，pm2 编排见 `ecosystem.config.js` 的 `kedu-mcp`
+（走仓库工作副本，只监听 `127.0.0.1`）：
+
+```bash
+pm2 start ecosystem.config.js --only kedu-mcp
+pm2 save
+```
+
+客户端侧对应写 `"type": "http", "url": "http://127.0.0.1:8000/mcp"`。
+
+### tool 一览
+
+| tool | 说明 |
+| --- | --- |
+| `kedu_get_price` | 行情，默认 `fq='pre'` |
+| `kedu_get_fundamentals` | 交易日截面基本面（DSL） |
+| `kedu_get_fundamentals_continuously` | 连续多日基本面（DSL） |
+| `kedu_get_history_fundamentals` | 多报告期基本面历史（字段表达式列表） |
+| `kedu_finance_run_query` | `STK_*` / `FUND_*` 原始表（DSL，`offset=True` 走分页） |
+| `kedu_get_valuation` | 估值 |
+| `kedu_get_all_securities` | 证券列表 |
+| `kedu_get_trade_days` | 交易日历 |
+| `kedu_get_industry` / `kedu_get_industry_stocks` | 行业归属 / 成分 |
+| `kedu_get_index_stocks` | 指数成分 |
+| `kedu_get_extras` | `is_st` 与基金净值 |
+| `kedu_describe` | API 目录、函数签名、finance 表字段、DSL 可用名字 |
+| `kedu_call` | 反射调用其余 26 个长尾 API |
+
+### 查询 DSL
+
+`get_fundamentals` 与 `finance.run_query` 的参数是 SQLAlchemy 查询对象，无法用 JSON 无损表达
+（`or_` / `in_` / 跨表都会丢），所以这两类 tool 收表达式字符串：
+
+```text
+query(valuation.code, valuation.pe_ratio).filter(valuation.pe_ratio < 10).limit(50)
+query(STK_INCOME_STATEMENT).filter(STK_INCOME_STATEMENT.code == '000001.XSHE').limit(20)
+```
+
+求值走受限 eval，三道闸：`mode="eval"` 编译（写不出 import/赋值）、`__builtins__` 置空、
+AST 预扫禁掉一切下划线名字与属性（堵死 `().__class__.__mro__` 逃逸链）。
+可用名字用 `kedu_describe(dsl=True)` 查。
+
+这是**本地单用户**工具的取舍。若要把 HTTP transport 暴露到可信边界之外，应改成结构化 filter 描述。
+
+### 出站上限
+
+结果超限即截断，并在正文开头给出醒目提示与收窄建议——不静默截断，也不直接报错。
+
+- 默认 200 行 / 40 列，硬上限 5000 行 / 400 列
+- 环境变量 `KEDU_MCP_MAX_ROWS` / `KEDU_MCP_MAX_COLS`，或启动参数 `--max-rows` / `--max-cols`
+- 单次调用可用 tool 的 `max_rows` / `max_cols` 参数临时抬高
+
 ## 数据回补脚本
 
 仓库内常用脚本：

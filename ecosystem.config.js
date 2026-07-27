@@ -20,5 +20,20 @@ module.exports = {
       max_memory_restart: "2G",
       time: true,
     },
+    {
+      // MCP server(streamable-http),给多个 MCP 客户端共享一个进程。
+      //   pm2 start ecosystem.config.js --only kedu-mcp
+      // stdio 用法不走 pm2,由客户端自己拉起,见 README。
+      // 只监听 127.0.0.1:受限 eval 的查询 DSL 假定调用方可信,不要绑到 0.0.0.0。
+      name: "kedu-mcp",
+      cwd: __dirname,
+      script: "uv",
+      args: "run --extra mcp --env-file .env kedu-mcp "
+        + "--transport http --host 127.0.0.1 --port 8000",
+      interpreter: "none",
+      autorestart: true,
+      max_memory_restart: "2G",
+      time: true,
+    },
   ],
 };
