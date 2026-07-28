@@ -189,3 +189,38 @@ def get_price(security: str | Sequence[str], start_date: str | dt.date | None = 
         return pd.DataFrame(cols, index=pd.Index(df[tcol].to_numpy(), name=tcol))
     return pd.DataFrame({"time": df[tcol].to_numpy(),
                          "code": df["instrument_id"].astype(object).to_numpy(), **cols})
+
+
+def get_fq_anchor(security: str | Sequence[str], frequency: str = "daily") -> pd.DataFrame:
+    """返回每票的前复权锚点: 锚定时间与该时点的累计 factor.
+
+    前复权是动态值 —— get_price(fq='pre') 把每票的价格乘以 factor/factor_last, 其中
+    factor_last 取自「该票在该表里最后一根 bar」的 factor(见上面 get_price 的 argMax
+    子查询, 那个子查询**不带日期过滤**)。所以锚随每次数据更新往后漂。
+
+    锚不能由查询窗口的最后一行推断: 窗口截在锚之前时, 窗口内每一行的 factor 都小于 1,
+    看不出锚落在哪天。要在图上或报告里标注复权口径, 就必须回到这一层单独取。
+
+    锚按表分别计算 —— bar_1d 与 bar_1m 的最后一根 bar 可能不是同一天, 故 frequency
+    必须与对应的 get_price 调用一致, 否则标注的锚和实际用的锚不是一个。
+
+    返回长表: code / anchor_time / anchor_factor, 按 code 排序; 无数据的代码不出现。
+    """
+    codes = [security] if isinstance(security, str) else list(security)
+    empty = pd.DataFrame(columns=["code", "anchor_time", "anchor_factor"])
+    if not codes:
+        return empty
+    if frequency in _DAILY:
+        table, tcol = "bar_1d", "date"
+    elif frequency in _MINUTE:
+        table, tcol = "bar_1m", "datetime"
+    else:
+        raise NotImplementedError("仅支持 daily / 1m")
+
+    inlist = ", ".join("'" + str(c).replace("'", "") + "'" for c in codes)
+    df = query_df(get_client(),
+                  f"SELECT instrument_id AS code, max({tcol}) AS anchor_time, "
+                  f"argMax(factor, {tcol}) AS anchor_factor "
+                  f"FROM {DATABASE}.{table} WHERE instrument_id IN ({inlist}) "
+                  f"GROUP BY instrument_id ORDER BY instrument_id")
+    return df if not df.empty else empty

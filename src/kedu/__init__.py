@@ -23,7 +23,7 @@ from .fundamentals import (  # noqa: F401
     get_fundamentals_continuously,
     get_history_fundamentals,
 )
-from .prices import get_price  # noqa: F401
+from .prices import get_price, get_fq_anchor  # noqa: F401
 from .finance import finance  # noqa: F401
 from .calendar import get_trade_days, get_all_trade_days  # noqa: F401
 from .securities import get_all_securities  # noqa: F401
@@ -72,6 +72,7 @@ __all__ = [
     "get_fundamentals_continuously",
     "get_history_fundamentals",
     "get_price",
+    "get_fq_anchor",
     "get_table_info",
     "get_trade_days",
     "get_all_trade_days",

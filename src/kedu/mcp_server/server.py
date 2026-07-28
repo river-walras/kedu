@@ -21,33 +21,22 @@ import contextlib
 import inspect
 import os
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 import kedu
 
 from ..db import auth_from_env
 from ..finance import finance
 from ..finance_schema import RUN_QUERY_TABLES
-from . import _dsl
+from . import _app, _dsl, _plot
+from ._invoke import DSL_TOOL_REDIRECT as _DSL_TOOL_REDIRECT
+from ._invoke import dispatchable as _dispatchable
+from ._invoke import invoke_kedu
+from ._invoke import summary as _summary
 from ._render import HARD_MAX_ROWS, render, resolve_limits
-
-# 这些名字不进 dispatcher: 查询表面是 SQLAlchemy 对象而非可 JSON 化的函数;
-# 认证类不该由模型调用; DSL 三兄弟有各自的专用 tool(参数是查询对象, 反射传不进去)。
-_DSL_SURFACE = {"query", "income", "balance", "cash_flow", "indicator", "valuation"}
-_NOT_DISPATCHABLE = _DSL_SURFACE | {
-    "auth",
-    "auth_from_env",
-    "get_client",
-    "DATABASE",
-    "finance",
-}
-_DSL_TOOL_REDIRECT = {
-    "get_fundamentals": "kedu_get_fundamentals",
-    "get_fundamentals_continuously": "kedu_get_fundamentals_continuously",
-    "get_history_fundamentals": "kedu_get_history_fundamentals",
-}
 
 INSTRUCTIONS = """\
 本地 ClickHouse 上的聚宽 jqdatasdk 复刻(库名 jqdata, 72 张表约 75 亿行)。
@@ -64,30 +53,16 @@ INSTRUCTIONS = """\
   可用名字见 kedu_describe(dsl=True)。
 - 结果有行数上限, 超出会截断并在开头标注; 需要更多行时调 max_rows, 或收窄查询条件。
 - 这里只列了高频 API。完整 API 目录用 kedu_describe(), 长尾 API 用 kedu_call() 调用。
+- kedu_plot 画交互式图表, 需要客户端支持 MCP Apps 扩展; 不支持时它会退回 CSV 文本。
 """
-
-
-def _dispatchable() -> dict[str, Any]:
-    """kedu.__all__ 中可由 kedu_call 反射调用的函数集合."""
-    out: dict[str, Any] = {}
-    for name in kedu.__all__:
-        if name in _NOT_DISPATCHABLE or name in _DSL_TOOL_REDIRECT:
-            continue
-        obj = getattr(kedu, name, None)
-        if callable(obj):
-            out[name] = obj
-    return out
-
-
-def _summary(fn: Any) -> str:
-    """取函数 docstring 的首行作为一句话摘要."""
-    doc = inspect.getdoc(fn) or ""
-    return doc.splitlines()[0] if doc else "(无 docstring)"
 
 
 def build_server(**settings: Any) -> FastMCP:
     """装配并返回 FastMCP 实例. settings 透传 host/port/streamable_http_path 等."""
     mcp = FastMCP("kedu", instructions=INSTRUCTIONS, **settings)
+    # MCP Apps 要双方在 initialize 里都声明扩展才算协商成功; 只在 tool 上挂 _meta.ui
+    # 不够, 严格的 host 会因此根本不去取 ui:// 资源。
+    _app.declare_ui_extension(mcp)
 
     # ------------------------------------------------------------------
     # 第一层: 高频 API 直出 tool
@@ -417,26 +392,87 @@ def build_server(**settings: Any) -> FastMCP:
         可用 API 与签名用 kedu_describe() 查。走的仍是 kedu.* 本身,
         复权/成员资格等语义与专用 tool 完全一致。
         """
-        if api in _DSL_TOOL_REDIRECT:
-            raise ValueError(
-                f"{api} 的参数是聚宽查询对象, 无法用 JSON 传递; "
-                f"请改用 tool {_DSL_TOOL_REDIRECT[api]}。"
+        return render(invoke_kedu(api, params), max_rows, max_cols)
+
+    # ------------------------------------------------------------------
+    # 第四层: MCP Apps —— 交互式图表
+    #
+    # 渲染器 HTML 与 kedu_plot 共用一个 ui:// 资源, URI 带内容哈希(见 _app)。
+    # 数据分两路: content 给模型看一行摘要, structuredContent 给 iframe 全量 option。
+    # 客户端没声明 MCP Apps 扩展时不返回 envelope —— 那只会把几百行 JSON 倒进模型
+    # 上下文, 还不如现有的 CSV。
+    # ------------------------------------------------------------------
+
+    @mcp.resource(
+        _app.chart_uri(),
+        name="kedu-chart-renderer",
+        description="kedu 图表渲染器(内联 ECharts, 供 kedu_plot 使用)",
+        mime_type=_app.UI_MIME_TYPE,
+        meta={"ui": {"prefersBorder": False}},
+    )
+    def chart_renderer() -> str:
+        return _app.chart_html()
+
+    @mcp.tool(
+        name="kedu_plot",
+        meta={"ui": {"resourceUri": _app.chart_uri(), "visibility": ["model"]}},
+    )
+    def plot(
+        chart: Literal["kline"],
+        source: _plot.KlineSource,
+        display: _plot.PlotDisplay | None = None,
+    ) -> CallToolResult:
+        """把 kedu 的数据画成可交互图表(需客户端支持 MCP Apps, 否则退回 CSV 文本)。
+
+        chart 目前只有 'kline'(K 线 + 成交量, 带缩放)。source 的字段语义与
+        kedu.get_price 完全一致 —— fq='pre' 是动态前复权, 锚定该票最后一根 bar,
+        图的副标题会把锚定日标出来。
+
+        数据由服务端自己取, 不要也不必把行数据传进来。
+        """
+        ctx = mcp.get_context()
+        df = kedu.get_price(
+            source.security,
+            start_date=source.start_date,
+            end_date=source.end_date,
+            frequency=source.frequency,
+            fq=source.fq,
+            count=source.count,
+        )
+        if not _app.client_supports_ui(ctx):
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=(
+                            "当前客户端未声明 MCP Apps 扩展, 无法渲染交互图表, "
+                            "以下为同一份数据的文本形式:\n\n" + render(df)
+                        ),
+                    )
+                ]
             )
-        registry = _dispatchable()
-        fn = registry.get(api)
-        if fn is None:
-            raise ValueError(
-                f"未知或不可调用的 API {api!r}。可用: {', '.join(sorted(registry))}"
-            )
-        try:
-            bound = inspect.signature(fn).bind(**(params or {}))
-        except TypeError as e:
-            raise ValueError(
-                f"{api} 参数不匹配: {e}\n签名: {api}{inspect.signature(fn)}"
-            ) from None
-        return render(fn(*bound.args, **bound.kwargs), max_rows, max_cols)
+        anchor = _fq_anchor(source) if source.fq == "pre" else None
+        envelope = _plot.compile_recipe(
+            chart, source, display, _plot.normalize_plot_data(df), anchor
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=_plot.envelope_summary(envelope))],
+            structuredContent=envelope,
+        )
 
     return mcp
+
+
+def _fq_anchor(source: _plot.KlineSource) -> dict[str, Any] | None:
+    """取前复权锚。锚必须来自复权语义层, 不能拿查询窗口的最后一行冒充."""
+    df = kedu.get_fq_anchor(source.security, frequency=source.frequency)
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "time": _plot._json_safe(row["anchor_time"]),
+        "factor": float(row["anchor_factor"]),
+    }
 
 
 def main(argv: list[str] | None = None) -> None:

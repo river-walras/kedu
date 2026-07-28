@@ -161,6 +161,7 @@ def test_expected_tools_are_registered():
         "kedu_get_extras",
         "kedu_describe",
         "kedu_call",
+        "kedu_plot",
     }
 
 
@@ -171,11 +172,11 @@ def test_every_tool_has_a_description():
 def test_dispatcher_covers_the_long_tail_of_kedu_all():
     """__all__ 里的函数要么有专用 tool, 要么能被 kedu_call 反射到, 不许漏。"""
     import kedu
-    from kedu.mcp_server import server as srv
+    from kedu.mcp_server import _invoke
 
-    reachable = set(srv._dispatchable()) | set(srv._DSL_TOOL_REDIRECT)
+    reachable = set(_invoke.dispatchable()) | set(_invoke.DSL_TOOL_REDIRECT)
     for name in kedu.__all__:
-        if name in srv._NOT_DISPATCHABLE:
+        if name in _invoke.NOT_DISPATCHABLE:
             continue
         if callable(getattr(kedu, name, None)):
             assert name in reachable, f"{name} 既没有专用 tool 也进不了 dispatcher"
@@ -183,9 +184,9 @@ def test_dispatcher_covers_the_long_tail_of_kedu_all():
 
 def test_query_object_apis_are_not_dispatchable():
     """吃查询对象的 API 不能进 dispatcher —— JSON 传不进去, 只会给出困惑的报错。"""
-    from kedu.mcp_server import server as srv
+    from kedu.mcp_server import _invoke
 
-    dispatchable = srv._dispatchable()
-    for name in srv._DSL_TOOL_REDIRECT:
+    dispatchable = _invoke.dispatchable()
+    for name in _invoke.DSL_TOOL_REDIRECT:
         assert name not in dispatchable
     assert "finance.run_offset_query" not in dispatchable

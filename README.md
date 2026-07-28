@@ -309,7 +309,29 @@ pm2 save
 | `kedu_get_index_stocks` | 指数成分 |
 | `kedu_get_extras` | `is_st` 与基金净值 |
 | `kedu_describe` | API 目录、函数签名、finance 表字段、DSL 可用名字 |
-| `kedu_call` | 反射调用其余 26 个长尾 API |
+| `kedu_call` | 反射调用其余长尾 API |
+| `kedu_plot` | 交互式图表（MCP Apps），目前只有 `chart='kline'` |
+
+### 图表（MCP Apps）
+
+`kedu_plot` 走 [MCP Apps 扩展](https://modelcontextprotocol.io/docs/extensions/apps)
+（`io.modelcontextprotocol/ui`）：工具的 `_meta.ui.resourceUri` 指向一个 `ui://` 资源，
+host 取回 HTML 在沙箱 iframe 里渲染，数据经 `structuredContent` 推给 iframe。
+
+- **数据不进模型。** `content` 只有一行摘要(标的、区间、复权口径),全量 option 与数据
+  在 `structuredContent` 里。
+- **双方都声明扩展。** 服务端在 `initialize` 的 `capabilities.extensions` 里声明
+  `io.modelcontextprotocol/ui` —— 规范要求双向声明,只挂 tool 的 `_meta.ui` 不够,
+  严格的 host 会因此根本不去取 `ui://` 资源。
+- **客户端不支持就退回文本。** 没在 `initialize` 里声明该扩展时,`kedu_plot` 返回的是同
+  一份数据的 CSV,不会把 envelope 倒进上下文。Claude Code 目前不在支持矩阵里。
+  少数 host 不声明却照样渲染 App(实测 MCPJam 1.5.17),这种情况下设
+  `KEDU_MCP_FORCE_UI=1` 强制走图表分支 —— 它放宽的是安全默认值,只在确知对端会渲染时开。
+- **渲染器整包内联**(约 1.39 MiB),不出网也不需要额外开端口 —— 见
+  `src/kedu/mcp_server/static/VENDOR.md`。资源 URI 带内容哈希,改了 HTML 缓存自然失效;
+  但规范只允许 host 缓存、不保证缓存(MCPJam 1.5.17 每次工具调用都重新读一遍)。
+- **前复权锚会画在副标题上。** `fq='pre'` 是动态值，锚由 `get_fq_anchor` 从复权语义层单独
+  取（不能拿查询窗口最后一天冒充），否则截图存档几天后数值就对不上。
 
 ### 查询 DSL
 

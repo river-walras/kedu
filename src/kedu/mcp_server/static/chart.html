@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>kedu chart</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent;
+    color: var(--color-text-primary, #24292f);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif; }
+  html[data-theme="dark"], html[data-theme="dark"] body {
+    color: var(--color-text-primary, #f0f3f6); }
+
+  /* 标题画在 DOM 而不是 canvas 里:canvas 文字不换行,窄屏会把副标题整段裁掉,
+     而副标题正是承载复权口径(fq / 锚定日 / 区间)的地方。 */
+  #hd { padding: 10px 14px 2px; }
+  #hd h1 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.35;
+           overflow-wrap: anywhere; }
+  #hd p  { margin: 3px 0 0; font-size: 11px; line-height: 1.5;
+           color: var(--color-text-secondary, #57606a);
+           overflow-wrap: anywhere; }
+  html[data-theme="dark"] #hd p {
+    color: var(--color-text-secondary, #b1bac4); }
+
+  #chart { width: 100%; height: 500px; }
+
+  #err { display: none; margin: 12px 14px; padding: 12px 14px; border-radius: 6px;
+         border: 1px solid #e5534b; background: rgba(229, 83, 75, .08);
+         color: #b62324; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #err.on { display: block; }
+  @media (prefers-color-scheme: dark) { #err { color: #ff938c; } }
+
+  @media (max-width: 480px) {
+    #hd { padding: 8px 10px 2px; }
+    #hd h1 { font-size: 13px; }
+    #hd p  { font-size: 10px; }
+    #chart { height: 360px; }
+  }
+</style>
+</head>
+<body>
+<header id="hd" hidden>
+  <h1 id="title"></h1>
+  <p id="subtitle"></p>
+</header>
+<div id="err" role="alert"></div>
+<div id="chart"></div>
+
+<!-- ECharts UMD:必须是 classic script,module 作用域下 UMD 拿不到全局挂载点。 -->
+<script>/*__KEDU_ECHARTS__*/</script>
+
+<script type="module">
+/*__KEDU_EXTAPPS__*/
+
+// envelope 契约版本。服务端 _plot.SCHEMA_VERSION 与此不一致就整张图拒绝渲染 ——
+// UI 资源可能被 host 缓存,宁可显式报版本错配,也不要拿旧渲染器去猜新 option。
+const SUPPORTED_SCHEMA = 2;
+
+const headerEl = document.getElementById('hd');
+const titleEl = document.getElementById('title');
+const subtitleEl = document.getElementById('subtitle');
+const chartEl = document.getElementById('chart');
+const errEl = document.getElementById('err');
+const app = new App({ name: 'kedu chart', version: '1.0.0' });
+
+let chart = null;
+let envelope = null;
+let theme = 'default';
+
+function fail(msg, detail) {
+  errEl.textContent = msg;
+  errEl.classList.add('on');
+  chartEl.style.display = 'none';
+  // 诊断走 notifications/message。不能用 ui/message —— 那条会把内容灌进对话,
+  // 让一次渲染失败变成模型的输入,既污染上下文又可能触发多余的后续动作。
+  try {
+    app.sendLog({ level: 'error', logger: 'kedu-chart',
+                  data: detail ? msg + ' :: ' + detail : msg });
+  } catch (_) { /* 未连接时无处可报,页面上的错误面板仍然可见 */ }
+}
+
+function draw() {
+  if (!chart) chart = echarts.init(chartEl, null, { renderer: 'canvas' });
+  chart.setTheme(theme);
+  chart.setOption(envelope.option, true);
+}
+
+function render(env) {
+  if (!env || typeof env !== 'object') {
+    fail('渲染失败:工具没有返回 structuredContent。\n' +
+         '若 host 未声明 MCP Apps 扩展,服务端会退回 CSV 文本 —— ' +
+         '这种 host 上可设 KEDU_MCP_FORCE_UI=1 强制走图表分支。');
+    return;
+  }
+  if (env.schema_version !== SUPPORTED_SCHEMA) {
+    fail('渲染失败:envelope schema_version=' + env.schema_version +
+         ',此渲染器只认 ' + SUPPORTED_SCHEMA + '。\n' +
+         'UI 资源与服务端版本错配 —— 资源 URI 带内容哈希,重连 MCP server 即可取到新版。');
+    return;
+  }
+  if (!env.option || typeof env.option !== 'object') {
+    fail('渲染失败:envelope 缺少 option。'); return;
+  }
+  envelope = env;
+  errEl.classList.remove('on');
+  chartEl.style.display = '';
+  titleEl.textContent = env.title || '';
+  subtitleEl.textContent = env.subtitle || '';
+  headerEl.hidden = !(env.title || env.subtitle);
+  try {
+    draw();
+  } catch (e) {
+    fail('渲染失败:ECharts 拒绝了该 option。', String((e && e.stack) || e));
+  }
+}
+
+app.ontoolresult = (result) => render(result && result.structuredContent);
+
+function applyHostContext(ctx) {
+  if (!ctx || typeof ctx !== 'object') return;
+  if (ctx.styles && ctx.styles.variables) {
+    applyHostStyleVariables(ctx.styles.variables);
+  }
+  if (ctx.theme !== 'dark' && ctx.theme !== 'light') return;
+
+  applyDocumentTheme(ctx.theme);
+  const next = ctx.theme === 'dark' ? 'dark' : 'default';
+  if (next === theme) return;
+  theme = next;
+  if (!envelope) return;
+  try {
+    draw();
+  } catch (e) {
+    fail('切换主题后重绘失败。', String((e && e.stack) || e));
+  }
+}
+
+// host-context-changed 的 params 是增量补丁。App 会先合并进内部 context, 所以这里必须
+// 取合并后的值; 直接读回调参数会把只含 deviceCapabilities 的 Phone 通知误判成亮色。
+app.onhostcontextchanged = () => applyHostContext(app.getHostContext());
+
+// 容器尺寸变化时重绘 canvas;向 host 报窗口尺寸由 SDK 的 ResizeObserver 负责,两者互不替代。
+new ResizeObserver(() => { if (chart) chart.resize(); }).observe(chartEl);
+
+await app.connect();
+try { app.setupSizeChangedNotifications(); } catch (_) { /* host 不支持则跳过 */ }
+try {
+  applyHostContext(app.getHostContext());
+} catch (_) { /* 拿不到就按 default 走 */ }
+</script>
+</body>
+</html>
