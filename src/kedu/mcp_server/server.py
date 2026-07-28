@@ -1,17 +1,18 @@
-"""kedu MCP server —— 分层混合设计.
+"""kedu MCP server —— 聚宽兼容 API + 受限只读 ClickHouse SQL.
 
 分层的理由: kedu 的价值全在语义层(复权动态锚、成员资格、report_type 多版本、
-行业 walk 折叠), 不在数据本身。任何绕开 `kedu.*` 直接打 ClickHouse 的设计都会
-静默丢掉这些语义 —— 返回的数字看着正常, 实际是错的。所以这个 server 的每条
-出口最终都落在 kedu 的公开函数上, 不提供裸 SQL 通道。
+行业 walk 折叠), 不在数据本身。高层 tool 继续提供与 jqdatasdk 对齐的语义；
+`kedu_query` 则为跨表、窗口、聚合等复杂分析提供完整 ClickHouse SELECT 能力。
+SQL 通道只使用独立只读账户，限定在 jqdata 数据域，不执行任何管理或写入操作。
 
-三层:
+四层:
 1. 高频 API 直出 tool(12 个) —— 完整 JSON Schema, 模型靠 name/description 就能选中。
 2. `kedu_call` 反射 dispatcher —— 兜住 __all__ 里剩下的长尾 API, 走的仍是 kedu.*,
    语义不丢; 新增 kedu API 时这里零改动。
-3. `kedu_describe` —— 列 API 目录、查函数签名、查 finance 表结构、列 DSL 可用名字。
+3. `kedu_query` —— 原生 ClickHouse SELECT，SQL 不转译、不改写业务逻辑。
+4. `kedu_describe` —— 列 API 目录、查函数签名、查表结构与语义、列 DSL 可用名字。
 
-出站一律经 _render.render(), 行/列超限即截断并给出醒目提示, 见 _render 模块 docstring。
+出站统一限制行列数，超限即截断并给出显式提示。
 """
 
 from __future__ import annotations
@@ -24,14 +25,14 @@ import sys
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 import kedu
 
 from ..db import auth_from_env
 from ..finance import finance
 from ..finance_schema import RUN_QUERY_TABLES
-from . import _app, _dsl, _plot
+from . import _app, _dsl, _plot, _query
 from ._invoke import DSL_TOOL_REDIRECT as _DSL_TOOL_REDIRECT
 from ._invoke import dispatchable as _dispatchable
 from ._invoke import invoke_kedu
@@ -39,21 +40,70 @@ from ._invoke import summary as _summary
 from ._render import HARD_MAX_ROWS, render, resolve_limits
 
 INSTRUCTIONS = """\
-本地 ClickHouse 上的聚宽 jqdatasdk 复刻(库名 jqdata, 72 张表约 75 亿行)。
-所有 tool 的返回语义与 jqdatasdk 逐字段对齐, 可直接当聚宽数据用。
+# 目标
 
-重要:
-- 不要用通用 ClickHouse/SQL 工具去查 jqdata 库。裸 SQL 会绕开复权因子、前复权动态锚、
-  成员资格语义、report_type 多版本去重、行业区间折叠等处理, 拿到的数字看着正常但是错的。
-  一切查询走本 server 的 tool。
-- get_price 默认 fq='pre'(前复权), 且前复权锚定全表最新交易日, 是动态值。
-  要不复权传 fq=None, 后复权传 fq='post'。
-- 基本面/finance 查询用表达式字符串写聚宽 DSL, 例如
-  query(valuation).filter(valuation.pe_ratio < 10).limit(50)
-  可用名字见 kedu_describe(dsl=True)。
-- 结果有行数上限, 超出会截断并在开头标注; 需要更多行时调 max_rows, 或收窄查询条件。
-- 这里只列了高频 API。完整 API 目录用 kedu_describe(), 长尾 API 用 kedu_call() 调用。
-- kedu_plot 画交互式图表, 需要客户端支持 MCP Apps 扩展; 不支持时它会退回 CSV 文本。
+使用本地 jqdata 数据完成用户的数据查询。返回实际查询结果；只有用户明确要求 SQL 时才只
+返回 SQL。不要猜测表名、字段、数据粒度或聚宽业务语义。
+
+# 工具选择
+
+- 如果需求可由 kedu_get_* 直接完成，必须优先调用对应 tool，以保留 jqdatasdk 的复权、
+  可见报告、成员资格和返回格式语义。
+- 如果需求对应未直接暴露的 kedu API，先用 kedu_describe(api=...) 核对签名，再用
+  kedu_call。不要用 kedu_call 调用已有专用 tool。
+- 只有在需要跨表 JOIN、窗口函数、自定义聚合、复杂子查询或原始关系字段时，才使用
+  kedu_query。
+- 如果不知道可用 API，调用不带参数的 kedu_describe。如果不知道 SQL 表，调用
+  kedu_describe(table='*')；如果不知道字段、引擎或表语义，使用精确表名再次调用。
+- 只有用户需要图表时才调用 kedu_plot。不要把查询出的逐行数据传给 kedu_plot；由它按
+  source 自行取数。
+
+# SQL 工作流
+
+1. 从请求中确定结果粒度、标的范围、时间范围、指标和排序。缺少会实质改变结果的条件时，
+   先向用户确认；能从上下文或表结构确定时不要提问。
+2. 查询当前上下文中尚未核对过的表结构。不要根据相似表或 jqdatasdk 字段名猜物理字段。
+3. 写一条只读 SELECT 或 EXPLAIN SELECT。显式选择字段、JOIN 键、日期边界和排序；对可能
+   产生多对多扩张的 JOIN，先按目标粒度聚合或验证键唯一性。
+4. 所有用户值都通过 ClickHouse typed placeholder 和 parameters 传入。不要把代码、日期、
+   名称或列表拼接进 SQL。
+5. 大表探索先使用窄日期范围、聚合或 LIMIT。只有结果本身需要更多明细时才提高 max_rows。
+6. 读取返回头中的 types、truncated、WARNING 和统计信息。如果 truncated=true，结果不完整；
+   改用聚合、分页条件或更窄范围后重新查询，不要基于截断样本声称全量结论。
+7. 检查结果粒度和关键计数是否符合请求。复杂聚合无法从结果直接验证时，执行一个聚焦的
+   count()、去重计数或分组检查。
+
+# 必须遵守的查询语义
+
+- kedu_query 不会改写 SQL，也不会自动添加复权、FINAL、report_type 或成员有效期条件。
+- bar_1d 和 bar_1m 存储原始价格。需要与 get_price 一致的价格时优先用 kedu_get_price；
+  必须用 SQL 时，显式处理 factor、停牌和动态前复权锚。
+- 查询 finance 原始表时，显式选择 report_type 和报告版本。查询财务可见性时，确保
+  pubDate <= 查询日，并按所需口径选择 statDate；或改用 kedu_get_fundamentals。
+- 查询成员历史时使用右端包含区间：start_date <= day AND
+  (end_date IS NULL OR end_date >= day)。查询权重时显式选择所需快照日。
+- kedu_describe 标为 FINAL 的关系在要求确定快照时使用 FINAL。不要对所有表机械添加 FINAL。
+- 日期按中国市场交易日语义解释。不要把自然日数量当作交易日数量。
+
+# 安全边界与失败处理
+
+- kedu_query 只接受一条 SELECT 或 EXPLAIN SELECT，数据库固定为 jqdata。服务端会拒绝
+  DDL、DML、system 库、跨库引用、SETTINGS、导出及未允许的表函数。不要尝试绕过拒绝。
+- SQL 因未知表或字段失败时，调用 kedu_describe 核对后修正。因查询规模超时或结果过大
+  失败时，收窄范围、提前聚合或拆成有明确边界的查询；不要盲目重复同一查询。
+- 凭据缺失、readonly 未生效或服务不可用时，报告具体错误。不要改用 CLICKHOUSE_USER，
+  不要声称已经取得数据。
+
+# 结果解释
+
+- kedu_query 返回元数据头和 CSV：\\N 表示 NULL，types 给出 ClickHouse 原生类型，WARNING
+  表示需要处理或向用户披露的语义风险。
+- 最终回答必须说明实际采用的时间范围、结果粒度和关键过滤条件。只在它们影响结论时说明
+  WARNING、截断或无法验证的部分。
+- get_price 默认 fq='pre'，前复权锚定全表最新交易日，是动态值；fq=None 为不复权，
+  fq='post' 为后复权。
+- 基本面和 finance 专用 tool 的 query_expr 使用聚宽 DSL。先用 kedu_describe(dsl=True)
+  获取可用名字，不要把 ClickHouse SQL 传给 query_expr。
 """
 
 
@@ -312,18 +362,63 @@ def build_server(**settings: Any) -> FastMCP:
         return render(df, max_rows)
 
     # ------------------------------------------------------------------
-    # 第二/三层: discovery + 反射 dispatcher
+    # 第二层: 完整只读 ClickHouse SELECT
+    # ------------------------------------------------------------------
+
+    @mcp.tool(
+        name="kedu_query",
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+    )
+    def query(
+        sql: str,
+        parameters: dict[str, Any] | None = None,
+        max_rows: int | None = None,
+    ) -> str:
+        """执行一条 jqdata 只读 ClickHouse 查询；用于 JOIN、窗口和自定义聚合。
+
+        何时使用:
+        - 跨表 JOIN、窗口函数、复杂子查询、自定义聚合或查询原始关系字段时使用。
+        - 单表行情、基本面、估值、成分等标准请求应改用对应 kedu_get_*，以保留聚宽语义。
+
+        调用步骤:
+        1. 先用 kedu_describe(table='*') 找表，再用精确表名核对字段、引擎和 semantics。
+        2. 明确结果粒度、JOIN 键、日期边界和排序后编写 SQL；大表探索使用聚合或 LIMIT。
+        3. 用户值使用 typed placeholder。例如 SQL 写
+           ``day >= {start:Date} AND code IN {codes:Array(String)}``，parameters 传
+           ``{'start': '2024-01-01', 'codes': ['000001.XSHE']}``。
+        4. 检查返回头中的 types、truncated 和 WARNING。truncated=true 时结果不完整，
+           应收窄查询或聚合后重试。
+
+        支持范围:
+        支持 CTE、子查询、UNION/INTERSECT/EXCEPT、全部 JOIN、ARRAY JOIN、窗口函数、
+        QUALIFY、ROLLUP/CUBE/GROUPING SETS、PREWHERE、FINAL 与 EXPLAIN。ClickHouse
+        处理标量和聚合函数；表函数只允许 numbers/values。
+
+        不自动处理的语义:
+        SQL 不会自动添加复权、FINAL、report_type、财报可见日期或成员有效区间条件。
+        返回的 WARNING 只提示风险，不会修改查询。
+
+        返回与失败:
+        返回元数据头和 CSV；\\N 表示 NULL，types 是 ClickHouse 原生类型，query_id 可用于
+        定位执行。服务端会拒绝非只读语句、跨库引用、system 表、SETTINGS、导出和危险
+        表函数；遇到拒绝时应改写为合规 SELECT，不要尝试绕过。
+        """
+        return _query.run(sql, parameters=parameters, max_rows=max_rows)
+
+    # ------------------------------------------------------------------
+    # 第三/四层: discovery + 反射 dispatcher
     # ------------------------------------------------------------------
 
     @mcp.tool(name="kedu_describe")
     def describe(
         api: str | None = None, table: str | None = None, dsl: bool = False
     ) -> str:
-        """查 kedu 的 API 目录、函数签名、finance 表结构、DSL 可用名字。
+        """查 kedu 的 API 目录、函数签名、jqdata/finance 表结构、DSL 可用名字。
 
         不带参数: 列出全部可用 API 及一句话说明。
         api='get_call_auction': 返回该 API 的签名与完整 docstring。
-        table='STK_INCOME_STATEMENT': 返回该 finance 表的字段与类型(不传表名则列全部表)。
+        table='*': 列 jqdata SQL 关系；table='bar_1d': 返回物理字段与查询语义；
+        table='STK_INCOME_STATEMENT': 返回 finance 逻辑表的字段与类型。
         dsl=True: 列出查询表达式里可用的全部名字。
         """
         parts: list[str] = []
@@ -334,15 +429,12 @@ def build_server(**settings: Any) -> FastMCP:
             )
         if table is not None:
             key = table.upper().replace("FINANCE.", "")
-            if key not in RUN_QUERY_TABLES:
-                parts.append(
-                    f"未知 finance 表 {table!r}。可用表:\n  "
-                    + ", ".join(sorted(RUN_QUERY_TABLES))
-                )
-            else:
+            if key in RUN_QUERY_TABLES:
                 parts.append(
                     f"finance.{key} 字段:\n" + render(finance.get_table_info(key), 500)
                 )
+            else:
+                parts.append(_query.describe_table(table))
         if api is not None:
             fn = _dispatchable().get(api) or getattr(kedu, api, None)
             if fn is None or not callable(fn):
@@ -367,6 +459,10 @@ def build_server(**settings: Any) -> FastMCP:
             lines.append(
                 f"\nfinance 表({len(RUN_QUERY_TABLES)} 张, 用 kedu_describe(table=...) 看字段):\n  "
                 + ", ".join(sorted(RUN_QUERY_TABLES))
+            )
+            lines.append(
+                "\nClickHouse SQL: 用 kedu_query 执行复杂只读查询；"
+                "用 kedu_describe(table='*') 查看 jqdata 表目录。"
             )
             rows, cols = resolve_limits()
             lines.append(
@@ -395,7 +491,7 @@ def build_server(**settings: Any) -> FastMCP:
         return render(invoke_kedu(api, params), max_rows, max_cols)
 
     # ------------------------------------------------------------------
-    # 第四层: MCP Apps —— 交互式图表
+    # 可视化: MCP Apps —— 交互式图表
     #
     # 渲染器 HTML 与 kedu_plot 共用一个 ui:// 资源, URI 带内容哈希(见 _app)。
     # 数据分两路: content 给模型看一行摘要, structuredContent 给 iframe 全量 option。

@@ -180,6 +180,10 @@ export CLICKHOUSE_PASSWORD=your_password
 export CLICKHOUSE_HOST=localhost
 export CLICKHOUSE_PORT=8123
 export CLICKHOUSE_DATABASE=jqdata
+
+# MCP kedu_query 专用，只能 SELECT jqdata.*，且 readonly=1
+export KEDU_READONLY_USER=agent
+export KEDU_READONLY_PASSWORD=readonly_password
 ```
 
 然后在脚本里：
@@ -195,25 +199,26 @@ auth_from_env()
 ## 常用命令
 
 ```bash
-UV_CACHE_DIR=/tmp/uv uv run pytest
-UV_CACHE_DIR=/tmp/uv uv run ruff check .
-UV_CACHE_DIR=/tmp/uv uv run ruff format .
+UV_CACHE_DIR=/tmp uv run pytest
+UV_CACHE_DIR=/tmp uv run ruff check .
+UV_CACHE_DIR=/tmp uv run ruff format .
 ```
 
 单测示例：
 
 ```bash
-UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_fundamentals.py -xvs
-UV_CACHE_DIR=/tmp/uv uv run pytest tests/test_index.py -xvs
+UV_CACHE_DIR=/tmp uv run pytest tests/test_fundamentals.py -xvs
+UV_CACHE_DIR=/tmp uv run pytest tests/test_index.py -xvs
 ```
 
 ## MCP server
 
-把 kedu 暴露给 Claude Code / Codex 等 MCP 客户端。分层混合设计：12 个高频 API 直出 tool，
-长尾 API 走 `kedu_call` 反射 dispatcher，`kedu_describe` 做发现。
+把 kedu 暴露给 Claude Code / Codex 等 MCP 客户端。12 个高频 API 直接提供聚宽兼容语义，
+长尾 API 走 `kedu_call`，复杂跨表分析走 `kedu_query`，`kedu_describe` 统一做发现。
 
-**不提供裸 SQL 通道**：每条出口最终都落在 `kedu.*` 上。直接打 ClickHouse 会绕开复权动态锚、
-成员资格语义、`report_type` 多版本去重、行业区间折叠等处理，拿到的数字看着正常但是错的。
+`kedu_query` 执行原生 ClickHouse SELECT，SQL 不转译、不改写。它使用独立的
+`KEDU_READONLY_*` 账户，并要求服务端实际生效 `readonly=1`；缺少凭据或账户并非只读时
+直接拒绝查询，不会回退到可能具有写权限的 `CLICKHOUSE_USER`。
 
 MCP server 走可选 extra，装 `kedu[mcp]` 即可；`kedu-mcp` 是包暴露的入口点。
 凭证从环境变量读取（`auth_from_env`），写在 MCP 配置的 `env` 块里即可，不需要 `--env-file`。
@@ -236,7 +241,9 @@ Claude Code（`~/.claude.json`）：
         "CLICKHOUSE_PORT": "8123",
         "CLICKHOUSE_USER": "admin",
         "CLICKHOUSE_PASSWORD": "<password>",
-        "CLICKHOUSE_DATABASE": "jqdata"
+        "CLICKHOUSE_DATABASE": "jqdata",
+        "KEDU_READONLY_USER": "agent",
+        "KEDU_READONLY_PASSWORD": "<readonly_password>"
       }
     }
   }
@@ -258,6 +265,8 @@ CLICKHOUSE_PORT = "8123"
 CLICKHOUSE_USER = "admin"
 CLICKHOUSE_PASSWORD = "<password>"
 CLICKHOUSE_DATABASE = "jqdata"
+KEDU_READONLY_USER = "agent"
+KEDU_READONLY_PASSWORD = "<readonly_password>"
 ```
 
 装进某个项目而不是临时拉起，用 `uv add 'kedu[mcp]'`，客户端 `command` 改成 `kedu-mcp`。
@@ -308,9 +317,46 @@ pm2 save
 | `kedu_get_industry` / `kedu_get_industry_stocks` | 行业归属 / 成分 |
 | `kedu_get_index_stocks` | 指数成分 |
 | `kedu_get_extras` | `is_st` 与基金净值 |
-| `kedu_describe` | API 目录、函数签名、finance 表字段、DSL 可用名字 |
+| `kedu_query` | `jqdata` 数据域的完整只读 ClickHouse SELECT |
+| `kedu_describe` | API 目录、jqdata/finance 表字段与语义、DSL 可用名字 |
 | `kedu_call` | 反射调用其余长尾 API |
 | `kedu_plot` | 交互式图表（MCP Apps），目前只有 `chart='kline'` |
+
+### ClickHouse SQL
+
+`kedu_query` 支持 CTE、集合查询、全部 JOIN、窗口函数、`QUALIFY`、`ARRAY JOIN`、
+`ROLLUP/CUBE/GROUPING SETS`、`PREWHERE`、`FINAL` 和 `EXPLAIN`。参数使用 ClickHouse
+typed placeholder：
+
+```sql
+SELECT instrument_id, date, close
+FROM jqdata.bar_1d
+WHERE instrument_id IN {codes:Array(String)}
+  AND date BETWEEN {start:Date} AND {end:Date}
+ORDER BY instrument_id, date
+```
+
+对应参数：
+
+```json
+{
+  "codes": ["000001.XSHE", "600000.XSHG"],
+  "start": "2024-01-01",
+  "end": "2024-12-31"
+}
+```
+
+只允许单条 `SELECT` 或 `EXPLAIN SELECT`。禁止 DDL/DML、`SETTINGS`、导出、其他数据库、
+`system.*` 和外部表函数；表函数仅允许本地生成数据的 `numbers` / `values`。
+
+SQL 层不会自动补充业务语义。`bar_1d/bar_1m` 是原始行情，复权需显式使用 `factor`；
+增量重插表可能需要 `FINAL`；finance 原始表需要显式处理 `report_type`；成员历史的
+`end_date` 为右端包含。执行结果会提示这些风险，完整目录和字段说明用：
+
+```text
+kedu_describe(table="*")
+kedu_describe(table="bar_1d")
+```
 
 ### 图表（MCP Apps）
 
@@ -388,5 +434,5 @@ AST 预扫禁掉一切下划线名字与属性（堵死 `().__class__.__mro__` �
 运行全部测试：
 
 ```bash
-UV_CACHE_DIR=/tmp/uv uv run pytest
+UV_CACHE_DIR=/tmp uv run pytest
 ```

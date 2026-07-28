@@ -16,6 +16,7 @@ pytest.importorskip("mcp", reason="MCP server 需要 `uv sync --extra mcp`")
 
 from kedu.mcp_server import build_server  # noqa: E402
 from kedu.mcp_server import _dsl, _render  # noqa: E402
+from kedu.mcp_server.server import INSTRUCTIONS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +162,39 @@ def test_expected_tools_are_registered():
         "kedu_get_extras",
         "kedu_describe",
         "kedu_call",
+        "kedu_query",
         "kedu_plot",
     }
 
 
 def test_every_tool_has_a_description():
     assert all(t.description for t in _tools())
+
+
+def test_query_tool_is_marked_readonly_and_has_a_small_schema():
+    tool = next(t for t in _tools() if t.name == "kedu_query")
+    assert tool.annotations.readOnlyHint is True
+    assert tool.annotations.openWorldHint is False
+    assert set(tool.inputSchema["properties"]) == {"sql", "parameters", "max_rows"}
+    assert tool.inputSchema["required"] == ["sql"]
+
+
+def test_server_instructions_define_tool_routing_and_query_workflow():
+    assert "# 工具选择" in INSTRUCTIONS
+    assert "# SQL 工作流" in INSTRUCTIONS
+    assert "# 安全边界与失败处理" in INSTRUCTIONS
+    assert "必须优先调用对应 tool" in INSTRUCTIONS
+    assert "typed placeholder" in INSTRUCTIONS
+    assert "truncated=true" in INSTRUCTIONS
+    assert "不要尝试绕过拒绝" in INSTRUCTIONS
+
+
+def test_query_tool_description_covers_use_workflow_result_and_failure():
+    description = next(t for t in _tools() if t.name == "kedu_query").description
+    for section in ("何时使用:", "调用步骤:", "支持范围:", "返回与失败:"):
+        assert section in description
+    assert "truncated=true" in description
+    assert "不要尝试绕过" in description
 
 
 def test_dispatcher_covers_the_long_tail_of_kedu_all():
